@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Snake Protocol — Information Theory Visualizer</title>
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --bg2: #0f0f17;
+    --panel: #11111c;
+    --panel2: #16162380;
+    --line: #2a2a3d;
+    --text: #e6e6f0;
+    --muted: #8a8aa3;
+    --accent: #4ea8ff;
+    --accent2: #4ed1a1;
+    --warn: #ff5a5a;
+    --warn-bg: #3a0d12;
+    --naive: #ff5ac8;
+    --opt: #4ea8ff;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  #app {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    height: 100vh; width: 100vw;
+  }
+  #stage {
+    position: relative;
+    background:
+      radial-gradient(circle at 30% 20%, #14142480 0%, transparent 60%),
+      radial-gradient(circle at 80% 80%, #0f1a1f80 0%, transparent 55%),
+      var(--bg);
+    overflow: hidden;
+  }
+  canvas#sim { display: block; width: 100%; height: 100%; }
+
+  /* floating header on stage */
+  #stageHead {
+    position: absolute; top: 14px; left: 18px;
+    pointer-events: none;
+    text-shadow: 0 1px 8px #000a;
+  }
+  #stageHead .t1 {
+    font-size: 13px; letter-spacing: 3px; color: var(--accent); font-weight: 700;
+  }
+  #stageHead .t2 { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  /* sidebar */
+  #panel {
+    background: linear-gradient(180deg, var(--panel) 0%, var(--bg2) 100%);
+    border-left: 1px solid var(--line);
+    padding: 16px 16px 14px;
+    overflow-y: auto;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  #panel::-webkit-scrollbar { width: 8px; }
+  #panel::-webkit-scrollbar-thumb { background: #2a2a3d; border-radius: 4px; }
+
+  .brand {
+    display: flex; align-items: baseline; gap: 8px;
+    border-bottom: 1px solid var(--line); padding-bottom: 12px;
+  }
+  .brand h1 {
+    font-size: 15px; margin: 0; letter-spacing: 2px; font-weight: 800;
+    background: linear-gradient(90deg, var(--naive), var(--opt));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .brand small { color: var(--muted); font-size: 10px; letter-spacing: 1px; }
+
+  .group { display: flex; flex-direction: column; gap: 9px; }
+  .label {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 10px; letter-spacing: 1.5px; color: var(--muted);
+    text-transform: uppercase;
+  }
+  .label .val { color: var(--text); font-weight: 700; letter-spacing: 0.5px; }
+
+  /* mode toggle */
+  .toggle {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+    background: #0b0b14;
+  }
+  .toggle button {
+    border: 0; cursor: pointer; padding: 9px 6px;
+    background: transparent; color: var(--muted);
+    font-family: inherit; font-size: 11px; letter-spacing: 1px; font-weight: 700;
+    transition: all .15s ease;
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+  }
+  .toggle button small { font-size: 8px; font-weight: 500; letter-spacing: .5px; opacity: .7; }
+  .toggle button[data-active="true"].naive { background: linear-gradient(180deg,#3a0d2e,#251020); color: var(--naive); }
+  .toggle button[data-active="true"].opt   { background: linear-gradient(180deg,#0d253a,#10202a); color: var(--opt); }
+
+  /* sliders */
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 4px; background: #20202e; border-radius: 2px; outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); cursor: pointer;
+    border: 2px solid #0a0a0f; box-shadow: 0 0 8px #4ea8ff66;
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); cursor: pointer; border: 2px solid #0a0a0f;
+  }
+
+  /* demo button */
+  .demo-btn {
+    cursor: pointer; padding: 10px; border-radius: 8px;
+    border: 1px solid var(--accent); background: #0d1a2a; color: var(--accent);
+    font-family: inherit; font-size: 11px; letter-spacing: 1.5px; font-weight: 700;
+    transition: all .15s ease;
+  }
+  .demo-btn:hover { background: #122337; box-shadow: 0 0 14px #4ea8ff33; }
+  .demo-btn[data-running="true"] {
+    border-color: var(--warn); color: var(--warn); background: var(--warn-bg);
+    animation: pulse 1s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.55;} }
+
+  /* metrics */
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .metric {
+    background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 8px 9px;
+  }
+  .metric .k { font-size: 9px; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; }
+  .metric .v { font-size: 17px; font-weight: 700; margin-top: 3px; }
+  .metric .u { font-size: 9px; color: var(--muted); margin-left: 2px; }
+  .metric.full { grid-column: 1 / -1; }
+
+  .bar { height: 4px; background: #1c1c2a; border-radius: 2px; margin-top: 6px; overflow: hidden; }
+  .bar > i { display:block; height:100%; width:0%; background: var(--accent); transition: width .2s; }
+
+  /* saturation banner */
+  #saturation {
+    border: 1px solid var(--warn); background: var(--warn-bg); color: var(--warn);
+    border-radius: 8px; padding: 10px; text-align: center;
+    font-size: 11px; letter-spacing: 1.5px; font-weight: 800;
+    display: none;
+  }
+  #saturation.on { display: block; animation: pulse 0.9s infinite; }
+
+  /* message banner */
+  #msg {
+    border-left: 3px solid var(--accent);
+    background: #0d1422; padding: 10px 12px; border-radius: 4px;
+    font-size: 11px; line-height: 1.55; color: var(--text);
+  }
+  #msg b { color: var(--accent); }
+
+  .legend {
+    display: flex; gap: 12px; font-size: 9px; color: var(--muted); letter-spacing: .5px;
+    border-top: 1px solid var(--line); padding-top: 10px; flex-wrap: wrap;
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .legend i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+
+  @media (max-width: 860px) {
+    #app { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+    #panel { border-left: 0; border-top: 1px solid var(--line); max-height: 46vh; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="sim"></canvas>
+    <div id="stageHead">
+      <div class="t1">SNAKE PROTOCOL // LIVE</div>
+      <div class="t2">each snake = one agent's state vector over time</div>
+    </div>
+  </div>
+
+  <aside id="panel">
+    <div class="brand">
+      <h1>SNAKE PROTOCOL</h1>
+      <small>v1.0</small>
+    </div>
+
+    <div class="group">
+      <div class="label">Encoding Mode</div>
+      <div class="toggle" id="modeToggle">
+        <button class="naive" data-mode="naive" data-active="true">NAIVE<small>JSON-like</small></button>
+        <button class="opt"   data-mode="optimized" data-active="false">OPTIMIZED<small>Bitmask</small></button>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="label"><span>Agent Count</span><span class="val" id="agentsVal">120</span></div>
+      <input type="range" id="agents" min="10" max="1000" step="1" value="120" />
+    </div>
+
+    <div class="group">
+      <div class="label"><span>Schema Density</span><span class="val" id="densityVal">55%</span></div>
+      <input type="range" id="density" min="10" max="100" step="1" value="55" />
+    </div>
+
+    <div class="group">
+      <div class="label"><span>Feature Correlation</span><span class="val" id="corrVal">60%</span></div>
+      <input type="range" id="corr" min="0" max="100" step="1" value="60" />
+    </div>
+
+    <div class="group">
+      <div class="label"><span>Simulation Speed</span><span class="val" id="speedVal">1.0×</span></div>
+      <input type="range" id="speed" min="25" max="300" step="5" value="100" />
+    </div>
+
+    <button class="demo-btn" id="demoBtn">▶ SATURATION DEMO</button>
+
+    <div class="metrics" id="metrics">
+      <div class="metric"><div class="k">Active Agents</div><div class="v" id="mAgents">0</div></div>
+      <div class="metric"><div class="k">FPS</div><div class="v" id="mFps">60</div></div>
+      <div class="metric"><div class="k">Avg Hamming</div><div class="v" id="mHamming">0<span class="u">bits</span></div></div>
+      <div class="metric"><div class="k">Collisions/s</div><div class="v" id="mColl">0</div></div>
+      <div class="metric full">
+        <div class="k">Bandwidth / agent</div>
+        <div class="v"><span id="mBw">0</span><span class="u" id="mBwU"> B</span></div>
+        <div class="bar"><i id="mBwBar"></i></div>
+      </div>
+    </div>
+
+    <div id="saturation">SATURATION POINT REACHED — JSON CHOKING</div>
+
+    <div id="msg">Drag the <b>Agent Count</b> slider up and watch NAIVE mode collapse while OPTIMIZED stays smooth. Or hit <b>Saturation Demo</b>.</div>
+
+    <div class="legend">
+      <span><i style="background:var(--naive)"></i>Naive snake</span>
+      <span><i style="background:var(--opt)"></i>Optimized snake</span>
+      <span><i style="background:var(--warn)"></i>Bit collision</span>
+    </div>
+  </aside>
+</div>
+
+<script>
+"use strict";
+(() => {
+  // ---------- DOM ----------
+  const canvas = document.getElementById('sim');
+  const ctx = canvas.getContext('2d', { alpha: true });
+  const stage = document.getElementById('stage');
+  const $ = id => document.getElementById(id);
+
+  // ---------- Config ----------
+  const config = {
+    mode: 'naive',
+    agentCount: 120,
+    density: 0.55,   // 0..1
+    correlation: 0.6,// 0..1
+    speed: 1.0,      // 0.25..3
+  };
+
+  // ---------- State ----------
+  let snakes = [];
+  let collisions = [];           // {x,y,born}
+  let clusters = [];             // feature-cluster zones {cx,cy,r}
+  let W = 0, H = 0, dpr = 1;
+  let lastT = performance.now();
+  let frameMs = 16.7, fpsEMA = 60;
+  let collideCountWindow = 0;    // collisions added this second
+  let collisionsPerSec = 0;
+  let lastSecMark = performance.now();
+
+  // ---------- Sizing ----------
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const r = stage.getBoundingClientRect();
+    W = Math.max(200, r.width);
+    H = Math.max(200, r.height);
+    canvas.width = Math.floor(W * dpr);
+    canvas.height = Math.floor(H * dpr);
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    seedClusters();
+  }
+  window.addEventListener('resize', resize);
+
+  // ---------- Helpers ----------
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const TAU = Math.PI * 2;
+
+  // ---------- Clusters ----------
+  function seedClusters() {
+    clusters.length = 0;
+    // number of feature clusters derived from density (8..24)
+    const n = Math.max(6, Math.round(8 + config.density * 16));
+    // tightness driven by correlation: high corr -> tight cluster radii
+    const tight = 0.15 + (1 - config.correlation) * 0.7; // radius factor
+    for (let i = 0; i < n; i++) {
+      const cx = rand(W * 0.08, W * 0.92);
+      const cy = rand(H * 0.08, H * 0.92);
+      const r = Math.max(18, Math.min(W, H) * tight * rand(0.6, 1.1));
+      clusters.push({ cx, cy, r });
+    }
+  }
+
+  // ---------- Snake factory ----------
+  function makeSnake(id) {
+    const opt = config.mode === 'optimized';
+    if (opt) {
+      const c = clusters[id % clusters.length];
+      const a = rand(0, TAU);
+      const rr = rand(0, c.r);
+      return {
+        id, opt: true,
+        x: c.cx + Math.cos(a) * rr,
+        y: c.cy + Math.sin(a) * rr,
+        angle: rand(0, TAU),
+        clusterId: id % clusters.length,
+        zone: c,
+        hue: (200 + (id % 2) * -55 + rand(-12, 12)), // blues ~200 / greens ~145
+        sat: 55 + rand(-10, 10),
+        light: 60 + rand(-8, 8),
+        tailLen: 3 + Math.floor(rand(0, 6)),   // 3..8
+        tail: [],
+        target: newTargetOpt(c),
+        pausedUntil: 0,
+        speed: rand(0.7, 1.2),
+        seed: Math.random() * 1000,
+      };
+    } else {
+      const hue = rand(0, 360);
+      return {
+        id, opt: false,
+        x: rand(0, W), y: rand(0, H),
+        angle: rand(0, TAU),
+        clusterId: -1, zone: null,
+        hue, sat: 90, light: 60,
+        tailLen: 20 + Math.floor(rand(0, 21)), // 20..40
+        tail: [],
+        target: { x: rand(0, W), y: rand(0, H) },
+        pausedUntil: 0,
+        speed: rand(0.9, 1.6),
+        seed: Math.random() * 1000,
+      };
+    }
+  }
+
+  function newTargetOpt(c) {
+    const a = rand(0, TAU), r = rand(0, c.r);
+    return { x: c.cx + Math.cos(a) * r, y: c.cy + Math.sin(a) * r };
+  }
+
+  // ---------- Rebuild population ----------
+  function rebuild() {
+    if (clusters.length === 0) seedClusters();
+    const n = config.agentCount;
+    if (snakes.length === n && snakes[0] && snakes[0].opt === (config.mode === 'optimized')) {
+      return; // nothing structural changed
+    }
+    // if mode changed, full rebuild; else resize
+    const sameMode = snakes.length > 0 && snakes[0].opt === (config.mode === 'optimized');
+    if (!sameMode) {
+      snakes = [];
+      for (let i = 0; i < n; i++) snakes.push(makeSnake(i));
+    } else {
+      if (n > snakes.length) {
+        for (let i = snakes.length; i < n; i++) snakes.push(makeSnake(i));
+      } else if (n < snakes.length) {
+        snakes.length = n;
+      }
+    }
+  }
+
+  // ---------- Update ----------
+  function update(dt, now) {
+    const speed = config.speed;
+    const step = dt * speed; // ms scaled
+
+    for (let i = 0; i < snakes.length; i++) {
+      const s = snakes[i];
+      if (now < s.pausedUntil) continue;
+
+      if (s.opt) {
+        // steer toward target inside zone
+        const dx = s.target.x - s.x, dy = s.target.y - s.y;
+        const d = Math.hypot(dx, dy);
+        if (d < 6) s.target = newTargetOpt(s.zone);
+        const desired = Math.atan2(dy, dx);
+        s.angle = lerpAngle(s.angle, desired, 0.12);
+        // mild jitter so it doesn't look mechanical
+        s.angle += Math.sin(now * 0.002 + s.seed) * 0.02;
+        const v = 0.04 * s.speed;
+        s.x += Math.cos(s.angle) * v * step;
+        s.y += Math.sin(s.angle) * v * step;
+        // clamp to zone
+        const rx = s.x - s.zone.cx, ry = s.y - s.zone.cy;
+        const rd = Math.hypot(rx, ry);
+        if (rd > s.zone.r) {
+          s.x = s.zone.cx + (rx / rd) * s.zone.r * 0.95;
+          s.y = s.zone.cy + (ry / rd) * s.zone.r * 0.95;
+          s.target = newTargetOpt(s.zone);
+        }
+      } else {
+        // pick a fresh random target frequently
+        if (Math.random() < 0.04) {
+          s.target.x = rand(0, W);
+          s.target.y = rand(0, H);
+        }
+        const dx = s.target.x - s.x, dy = s.target.y - s.y;
+        const desired = Math.atan2(dy, dx);
+        s.angle = lerpAngle(s.angle, desired + rand(-0.6, 0.6), 0.25); // erratic
+        const v = 0.06 * s.speed;
+        s.x += Math.cos(s.angle) * v * step;
+        s.y += Math.sin(s.angle) * v * step;
+        if (s.x < 0) { s.x = 0; s.target.x = rand(0, W); }
+        if (s.x > W) { s.x = W; s.target.x = rand(0, W); }
+        if (s.y < 0) { s.y = 0; s.target.y = rand(0, H); }
+        if (s.y > H) { s.y = H; s.target.y = rand(0, H); }
+      }
+
+      // tail
+      s.tail.push(s.x, s.y);
+      const maxLen = s.tailLen * 2;
+      if (s.tail.length > maxLen) {
+        s.tail.splice(0, s.tail.length - maxLen);
+      }
+    }
+  }
+
+  function lerpAngle(a, b, t) {
+    let diff = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
+    return a + diff * t;
+  }
+
+  // ---------- Collision detection (spatial hash) ----------
+  function detectCollisions(now) {
+    const cell = 14;
+    const grid = new Map();
+    const proximity = config.mode === 'optimized' ? 6 : 5;
+
+    // probability that an overlap actually registers as a bit collision
+    // naive: scales with density (more features packed -> more clashes)
+    // optimized: only when density forces bits < features (density > ~0.75)
+    let pCollide;
+    if (config.mode === 'naive') {
+      pCollide = 0.02 + config.density * 0.10;
+    } else {
+      // protocol has headroom until schema saturates; above ~75% density it spikes
+      const over = Math.max(0, (config.density - 0.7) / 0.3);
+      pCollide = 0.004 + over * 0.06 * (1 - config.correlation * 0.4);
+    }
+
+    for (let i = 0; i < snakes.length; i++) {
+      const s = snakes[i];
+      const cx = (s.x / cell) | 0, cy = (s.y / cell) | 0;
+      for (let gx = cx - 1; gx <= cx + 1; gx++) {
+        for (let gy = cy - 1; gy <= cy + 1; gy++) {
+          const key = gx + ',' + gy;
+          const bucket = grid.get(key);
+          if (!bucket) continue;
+          for (let b = 0; b < bucket.length; b++) {
+            const o = bucket[b];
+            if (o.id >= s.id) continue;
+            const dx = o.x - s.x, dy = o.y - s.y;
+            if (dx * dx + dy * dy < proximity * proximity) {
+              if (Math.random() < pCollide) {
+                registerCollision((s.x + o.x) / 2, (s.y + o.y) / 2, s, o, now);
+              }
+            }
+          }
+        }
+      }
+      const key = cx + ',' + cy;
+      let bucket = grid.get(key);
+      if (!bucket) { bucket = []; grid.set(key, bucket); }
+      bucket.push(s);
+    }
+  }
+
+  function registerCollision(x, y, a, b, now) {
+    collisions.push({ x, y, born: now, tooltip: Math.random() < 0.35 });
+    a.pausedUntil = Math.max(a.pausedUntil, now + 500);
+    b.pausedUntil = Math.max(b.pausedUntil, now + 500);
+    collideCountWindow++;
+  }
+
+  // ---------- Synthetic naive overhead (intentional) ----------
+  // Emulates JSON serialization cost growing with agent count so NAIVE visibly chokes
+  // past ~300 agents, while OPTIMIZED stays O(n).
+  function naiveOverhead() {
+    if (config.mode !== 'naive') return;
+    const n = snakes.length;
+    if (n < 250) return;
+    // extra work proportional to (n - 250)
+    const iters = Math.floor((n - 250) * 2.2);
+    let acc = 0;
+    // string-build emulation (allocations) — kept bounded
+    for (let i = 0; i < iters; i++) {
+      acc += (i * 7 + (i & 3)) % 13;
+    }
+    // touch to avoid dead-code elimination
+    if (acc === -1) console.log(acc);
+  }
+
+  // ---------- Rendering ----------
+  function clearWithTrail() {
+    // translucent fill leaves subtle motion trails
+    ctx.fillStyle = config.mode === 'naive' ? 'rgba(10,10,15,0.28)' : 'rgba(8,12,18,0.34)';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawGrid() {
+    const g = 48;
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = config.mode === 'naive' ? 'rgba(255,255,255,0.025)' : 'rgba(78,168,255,0.05)';
+    ctx.beginPath();
+    for (let x = (W % g) / 2; x < W; x += g) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+    for (let y = (H % g) / 2; y < H; y += g) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    ctx.stroke();
+
+    // zone outlines (optimized mode)
+    if (config.mode === 'optimized') {
+      ctx.strokeStyle = 'rgba(78,168,255,0.08)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < clusters.length; i++) {
+        const c = clusters[i];
+        ctx.beginPath();
+        ctx.arc(c.cx, c.cy, c.r, 0, TAU);
+        ctx.stroke();
+      }
+    }
+  }
+
+  function drawSnakes(now) {
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (let i = 0; i < snakes.length; i++) {
+      const s = snakes[i];
+      const paused = now < s.pausedUntil;
+      const baseAlpha = paused ? 0.35 : 1;
+
+      // tail polyline with fading width/alpha
+      const pts = s.tail;
+      const segs = pts.length / 2 - 1;
+      if (segs >= 1) {
+        for (let k = 0; k < segs; k++) {
+          const f = k / segs;        // 0 tail .. 1 head
+          const a = (0.06 + f * 0.6) * baseAlpha;
+          ctx.strokeStyle = `hsla(${s.hue},${s.sat}%,${s.light}%,${a})`;
+          ctx.lineWidth = (s.opt ? 1.4 : 1.6) + f * (s.opt ? 1.6 : 2.6);
+          ctx.beginPath();
+          ctx.moveTo(pts[k * 2], pts[k * 2 + 1]);
+          ctx.lineTo(pts[k * 2 + 2], pts[k * 2 + 3]);
+          ctx.stroke();
+        }
+      }
+      // head
+      ctx.fillStyle = `hsla(${s.hue},${s.sat}%,${Math.min(80, s.light + 10)}%,${baseAlpha})`;
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.opt ? 2.4 : 3.0, 0, TAU);
+      ctx.fill();
+    }
+  }
+
+  function drawCollisions(now) {
+    for (let i = collisions.length - 1; i >= 0; i--) {
+      const c = collisions[i];
+      const age = now - c.born;
+      if (age > 900) { collisions.splice(i, 1); continue; }
+      const t = age / 900;
+      const a = 1 - t;
+      const sz = 6 + t * 8;
+      ctx.strokeStyle = `rgba(255,90,90,${a})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(c.x - sz, c.y - sz); ctx.lineTo(c.x + sz, c.y + sz);
+      ctx.moveTo(c.x + sz, c.y - sz); ctx.lineTo(c.x - sz, c.y + sz);
+      ctx.stroke();
+
+      // DATA LOSS text briefly
+      if (age < 450) {
+        ctx.fillStyle = `rgba(255,90,90,${a})`;
+        ctx.font = '700 9px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('DATA LOSS', c.x, c.y - sz - 4);
+      }
+      // tooltip on a subset
+      if (c.tooltip && age < 800) {
+        ctx.fillStyle = `rgba(255,200,200,${a * 0.9})`;
+        ctx.font = '8px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('BIT COLLISION: Feature Overwritten', c.x, c.y + sz + 10);
+      }
+    }
+    ctx.textAlign = 'start';
+  }
+
+  function render(now) {
+    clearWithTrail();
+    drawGrid();
+    drawSnakes(now);
+    drawCollisions(now);
+  }
+
+  // ---------- Metrics ----------
+  function computeHamming() {
+    // cheap proxy: average pairwise distance of snake heads from canvas center,
+    // quantized to "bits". Optimized -> small (clustered); Naive -> large.
+    if (snakes.length === 0) return 0;
+    let sum = 0;
+    const cx = W / 2, cy = H / 2;
+    const norm = Math.hypot(W, H) / 2;
+    for (let i = 0; i < snakes.length; i++) {
+      const s = snakes[i];
+      const d = Math.hypot(s.x - cx, s.y - cy) / norm; // 0..1
+      sum += d;
+    }
+    const avg = sum / snakes.length;            // 0..1
+    const bits = Math.round(avg * 64);          // map to "bit distance" 0..64
+    return bits;
+  }
+
+  function computeBandwidth() {
+    // Optimized: fixed 24 bytes/agent (3x uint64 bitmask).
+    // Naive: scales with density (features) and per-feature overhead (key+value+quotes+delims).
+    if (config.mode === 'optimized') return 24;
+    // ~ features per agent = density * 32 ; each ~ 14 bytes avg (key=val,)
+    const features = Math.max(1, Math.round(config.density * 32));
+    const framing = 6; // braces, newlines
+    return framing + features * 14;
+  }
+
+  function updateMetricsDOM(now) {
+    // rolling collisions/sec
+    if (now - lastSecMark >= 1000) {
+      collisionsPerSec = collideCountWindow;
+      collideCountWindow = 0;
+      lastSecMark = now;
+    }
+    const hamming = computeHamming();
+    const bw = computeBandwidth();
+    $('mAgents').textContent = snakes.length;
+    $('mFps').textContent = Math.round(fpsEMA);
+    $('mHamming').innerHTML = hamming + '<span class="u">bits</span>';
+    $('mColl').textContent = collisionsPerSec;
+    $('mBw').textContent = bw;
+    $('mBwU').textContent = bw >= 1024 ? ' KB' : ' B';
+    if (bw >= 1024) $('mBw').textContent = (bw / 1024).toFixed(1);
+    // bandwidth bar relative to ~512B cap
+    const bwPct = Math.min(100, (bw / 512) * 100);
+    $('mBwBar').style.width = bwPct + '%';
+    $('mBwBar').style.background = config.mode === 'optimized' ? 'var(--accent2)' : 'var(--naive)';
+
+    // saturation
+    const saturated = (config.mode === 'naive' && (fpsEMA < 30 || collisionsPerSec > 40));
+    $('saturation').classList.toggle('on', saturated);
+
+    // educational message
+    updateMessage();
+  }
+
+  function updateMessage() {
+    const n = snakes.length;
+    const el = $('msg');
+    let html;
+    if (config.mode === 'naive') {
+      if (n < 150) html = '<b>JSON is better here</b> — readable, flexible, zero schema overhead. Small N tolerates the cost.';
+      else if (n < 300) html = '<b>Trade-off zone</b> — pick your poison. Naive still works but the cost is climbing.';
+      else if (n < 500) html = '<b>Naive is straining.</b> Long messages, repeated keys, garbage-collection pressure. Bandwidth is blowing up.';
+      else html = '<b>Bitmask wins</b> — compact, fast, scalable. Naive serialization cost grows with every agent.';
+    } else {
+      if (config.density > 0.78) html = '<b>Even bitmasks saturate</b> when bits &lt; features. Schema density is hitting the protocol limit.';
+      else if (config.correlation < 0.25) html = 'Low correlation scatters optimized snakes too — related features no longer share zones.';
+      else if (n >= 800) html = '<b>Optimized holds the line.</b> Fixed 24 B/agent, O(n) work — this is why protocol optimization matters at scale.';
+      else html = '<b>Bitmask protocol:</b> related features mapped to adjacent bits, agents cluster into feature zones. Low Hamming distance, low collision.';
+    }
+    el.innerHTML = html;
+  }
+
+  // ---------- Main loop ----------
+  function frame(now) {
+    let dt = now - lastT;
+    if (dt > 60) dt = 60;        // clamp tab-switch spikes
+    lastT = now;
+    frameMs = frameMs * 0.9 + dt * 0.1;
+    const inst = 1000 / Math.max(1, dt);
+    fpsEMA = fpsEMA * 0.92 + inst * 0.08;
+
+    naiveOverhead();
+    update(dt, now);
+    detectCollisions(now);
+    render(now);
+    updateMetricsDOM(now);
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- UI wiring ----------
+  function bindRange(id, key, fmt, transform, after) {
+    const el = $(id);
+    el.addEventListener('input', () => {
+      const raw = parseFloat(el.value);
+      const v = transform ? transform(raw) : raw;
+      config[key] = v;
+      $(id + 'Val').textContent = fmt(v);
+      if (after) after();
+    });
+  }
+
+  bindRange('agents', 'agentCount', v => Math.round(v), v => Math.round(v), () => {
+    cancelDemo();
+    rebuild();
+  });
+  bindRange('density', 'density', v => Math.round(v * 100) + '%', v => v / 100, () => {
+    // density affects clusters (count + collision probability)
+    seedClusters();
+    if (config.mode === 'optimized') reassignZones();
+  });
+  bindRange('corr', 'correlation', v => Math.round(v * 100) + '%', v => v / 100, () => {
+    seedClusters();
+    if (config.mode === 'optimized') reassignZones();
+  });
+  bindRange('speed', 'speed', v => v.toFixed(1) + '×', v => v / 100);
+
+  function reassignZones() {
+    for (let i = 0; i < snakes.length; i++) {
+      const s = snakes[i];
+      const c = clusters[s.clusterId % clusters.length];
+      s.zone = c;
+    }
+  }
+
+  // mode toggle
+  document.querySelectorAll('#modeToggle button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      cancelDemo();
+      const m = btn.getAttribute('data-mode');
+      config.mode = m;
+      document.querySelectorAll('#modeToggle button').forEach(b => {
+        b.setAttribute('data-active', b === btn ? 'true' : 'false');
+      });
+      // force full rebuild
+      snakes = [];
+      rebuild();
+    });
+  });
+
+  // ---------- Saturation demo ----------
+  let demoRAF = 0, demoStart = 0, demoFrom = 10, demoActive = false;
+  const DEMO_MS = 12000;
+  function startDemo() {
+    if (demoActive) { cancelDemo(); return; }
+    demoActive = true;
+    demoStart = performance.now();
+    demoFrom = config.agentCount;
+    $('demoBtn').setAttribute('data-running', 'true');
+    $('demoBtn').textContent = '■ STOP DEMO';
+    // start in naive mode for dramatic contrast
+    if (config.mode !== 'naive') {
+      config.mode = 'naive';
+      document.querySelectorAll('#modeToggle button').forEach(b => {
+        b.setAttribute('data-active', b.getAttribute('data-mode') === 'naive' ? 'true' : 'false');
+      });
+      snakes = [];
+    }
+    demoLoop(demoStart);
+  }
+  function cancelDemo() {
+    if (!demoActive) return;
+    demoActive = false;
+    cancelAnimationFrame(demoRAF);
+    $('demoBtn').setAttribute('data-running', 'false');
+    $('demoBtn').textContent = '▶ SATURATION DEMO';
+  }
+  function demoLoop(now) {
+    if (!demoActive) return;
+    const t = Math.min(1, (now - demoStart) / DEMO_MS);
+    const v = Math.round(10 + Math.pow(t, 1.15) * 990);
+    config.agentCount = v;
+    $('agents').value = v;
+    $('agentsVal').textContent = v;
+    rebuild();
+    if (t < 1) demoRAF = requestAnimationFrame(demoLoop);
+    else cancelDemo();
+  }
+  $('demoBtn').addEventListener('click', startDemo);
+
+  // ---------- Boot ----------
+  resize();
+  rebuild();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
