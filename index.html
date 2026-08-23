@@ -42,18 +42,38 @@
       var(--bg);
     overflow: hidden;
   }
-  canvas#sim { display: block; width: 100%; height: 100%; }
+  #sim { position: absolute; inset: 0; }
+  #sim canvas { display: block; }
+
+  /* cinematic vignette over the 3D stage */
+  #stage::after {
+    content: ''; position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 52%, rgba(0,0,0,0.5) 100%);
+  }
 
   /* floating header on stage */
   #stageHead {
     position: absolute; top: 14px; left: 18px;
-    pointer-events: none;
+    pointer-events: none; z-index: 5;
     text-shadow: 0 1px 8px #000a;
   }
   #stageHead .t1 {
     font-size: 13px; letter-spacing: 3px; color: var(--accent); font-weight: 700;
   }
   #stageHead .t2 { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+  #stageHint {
+    position: absolute; bottom: 12px; left: 18px; z-index: 5;
+    font-size: 9px; letter-spacing: 2px; color: var(--muted);
+    pointer-events: none; opacity: .8; text-shadow: 0 1px 6px #000;
+  }
+
+  /* CSS2D collision labels */
+  .coll-label {
+    font-family: inherit; font-size: 8px; letter-spacing: 1px;
+    color: #ffb0b0; text-shadow: 0 1px 6px #000;
+    white-space: nowrap; pointer-events: none;
+  }
 
   /* sidebar */
   #panel {
@@ -62,6 +82,7 @@
     padding: 16px 16px 14px;
     overflow-y: auto;
     display: flex; flex-direction: column; gap: 14px;
+    z-index: 10;
   }
   #panel::-webkit-scrollbar { width: 8px; }
   #panel::-webkit-scrollbar-thumb { background: #2a2a3d; border-radius: 4px; }
@@ -179,17 +200,18 @@
 <body>
 <div id="app">
   <div id="stage">
-    <canvas id="sim"></canvas>
+    <div id="sim"></div>
     <div id="stageHead">
       <div class="t1">SNAKE PROTOCOL // LIVE</div>
       <div class="t2">each snake = one agent's state vector over time</div>
     </div>
+    <div id="stageHint">SCROLL · ZOOM&ensp;—&ensp;DRAG · PAN</div>
   </div>
 
   <aside id="panel">
     <div class="brand">
       <h1>SNAKE PROTOCOL</h1>
-      <small>v1.0</small>
+      <small>v2.0 · webgl</small>
     </div>
 
     <div class="group">
@@ -246,13 +268,26 @@
   </aside>
 </div>
 
-<script>
-"use strict";
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/build/three.module.js",
+    "three/addons/": "./vendor/three/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
 (() => {
   // ---------- DOM ----------
-  const canvas = document.getElementById('sim');
-  const ctx = canvas.getContext('2d', { alpha: true });
-  const stage = document.getElementById('stage');
+  const stage = document.getElementById('sim');
   const $ = id => document.getElementById(id);
 
   // ---------- Config ----------
@@ -264,230 +299,470 @@
     speed: 1.0,      // 0.25..3
   };
 
+  // ---------- World ----------
+  const WORLD = { w: 920, h: 540, d: 400 };
+  const MAX_AGENTS = 1000, MAX_TAIL = 40;
+  const TAU = Math.PI * 2;
+  const rand = (a, b) => a + Math.random() * (b - a);
+
   // ---------- State ----------
   let snakes = [];
-  let collisions = [];           // {x,y,born}
-  let clusters = [];             // feature-cluster zones {cx,cy,r}
-  let W = 0, H = 0, dpr = 1;
+  let collisions = [];            // { pos, born, sprite, label }
+  let clusters = [];              // { cx,cy,cz,r }
   let lastT = performance.now();
-  let frameMs = 16.7, fpsEMA = 60;
-  let collideCountWindow = 0;    // collisions added this second
+  let fpsEMA = 60;
+  let collideCountWindow = 0;
   let collisionsPerSec = 0;
   let lastSecMark = performance.now();
 
+  // ---------- Renderer / Scene ----------
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  stage.appendChild(renderer.domElement);
+
+  const labelRenderer = new CSS2DRenderer();
+  labelRenderer.domElement.style.position = 'absolute';
+  labelRenderer.domElement.style.inset = '0';
+  labelRenderer.domElement.style.pointerEvents = 'none';
+  stage.appendChild(labelRenderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0a0a0f);
+  scene.fog = new THREE.FogExp2(0x0a0a0f, 0.00032);
+
+  const camera = new THREE.PerspectiveCamera(50, 1, 1, 6000);
+  camera.position.set(0, 480, 1080);
+  camera.lookAt(0, 0, 0);
+
+  // world group: idle sway moves this, never the camera (no rotation allowed)
+  const world = new THREE.Group();
+  scene.add(world);
+
+  // ---------- Controls: zoom + pan only, no orbiting ----------
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableRotate = false;
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.screenSpacePanning = true;
+  controls.minDistance = 260;
+  controls.maxDistance = 1500;
+  controls.zoomSpeed = 0.9;
+  controls.target.set(0, 0, 0);
+
+  let interacting = false, swayAmp = 1;
+  controls.addEventListener('start', () => { interacting = true; });
+  controls.addEventListener('end', () => { interacting = false; });
+
+  const PAN_LIMIT = new THREE.Vector3(WORLD.w * 0.5, WORLD.h * 0.5, WORLD.d * 0.5);
+  const PAN_MIN = PAN_LIMIT.clone().negate();
+  const PAN_ZERO = new THREE.Vector3(0, 0, 0);
+
+  // ---------- Textures ----------
+  function makeGlowTexture() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const g = c.getContext('2d');
+    const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.35, 'rgba(255,255,255,0.55)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 64, 64);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+  function makeRingTexture() {
+    const c = document.createElement('canvas');
+    c.width = c.height = 64;
+    const g = c.getContext('2d');
+    g.strokeStyle = 'rgba(255,120,120,1)';
+    g.lineWidth = 5;
+    g.beginPath();
+    g.arc(32, 32, 26, 0, TAU);
+    g.stroke();
+    g.strokeStyle = 'rgba(255,255,255,0.9)';
+    g.lineWidth = 2;
+    g.beginPath();
+    g.arc(32, 32, 26, 0, TAU);
+    g.stroke();
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+  const glowTex = makeGlowTexture();
+  const ringTex = makeRingTexture();
+
+  // ---------- Ambience: dust + grid + bounds ----------
+  const dust = (() => {
+    const N = 700;
+    const pos = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) {
+      pos[i * 3]     = rand(-WORLD.w * 0.75, WORLD.w * 0.75);
+      pos[i * 3 + 1] = rand(-WORLD.h * 0.75, WORLD.h * 0.75);
+      pos[i * 3 + 2] = rand(-WORLD.d * 1.2, WORLD.d * 0.9);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    const mat = new THREE.PointsMaterial({
+      size: 1.8, map: glowTex, color: 0x3a4a6e, transparent: true, opacity: 0.45,
+      blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
+    });
+    const pts = new THREE.Points(geo, mat);
+    pts.frustumCulled = false;
+    world.add(pts);
+    return pts;
+  })();
+
+  const grid = (() => {
+    const g = new THREE.GridHelper(WORLD.w * 1.4, 22, 0x2a2a3d, 0x1a1a2c);
+    g.position.y = -WORLD.h * 0.5;
+    g.material.transparent = true;
+    g.material.opacity = 0.35;
+    g.material.depthWrite = false;
+    world.add(g);
+    return g;
+  })();
+
+  const boundsBox = (() => {
+    const geo = new THREE.EdgesGeometry(new THREE.BoxGeometry(WORLD.w, WORLD.h, WORLD.d));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x4ea8ff, transparent: true, opacity: 0.06,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const box = new THREE.LineSegments(geo, mat);
+    world.add(box);
+    return box;
+  })();
+
+  // ---------- Snake buffers (merged, dynamic) ----------
+  const TAIL_VERTS = MAX_AGENTS * (MAX_TAIL - 1) * 2;
+  const tailGeo = new THREE.BufferGeometry();
+  tailGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TAIL_VERTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  tailGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(TAIL_VERTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  const tailLines = new THREE.LineSegments(tailGeo, new THREE.LineBasicMaterial({
+    vertexColors: true, transparent: true,
+    blending: THREE.AdditiveBlending, depthWrite: false,
+  }));
+  tailLines.frustumCulled = false;
+  world.add(tailLines);
+
+  const headGeo = new THREE.BufferGeometry();
+  headGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_AGENTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  headGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAX_AGENTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
+  const headMat = new THREE.PointsMaterial({
+    size: 6, map: glowTex, vertexColors: true, transparent: true,
+    blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
+  });
+  const heads = new THREE.Points(headGeo, headMat);
+  heads.frustumCulled = false;
+  world.add(heads);
+
+  // ---------- Zone meshes (optimized mode) ----------
+  const zoneGroup = new THREE.Group();
+  world.add(zoneGroup);
+
+  function rebuildZoneMeshes() {
+    while (zoneGroup.children.length) {
+      const o = zoneGroup.children.pop();
+      o.geometry && o.geometry.dispose();
+      o.material && o.material.dispose();
+    }
+    if (config.mode !== 'optimized') return;
+    for (const c of clusters) {
+      const wire = new THREE.Mesh(
+        new THREE.SphereGeometry(c.r, 18, 12),
+        new THREE.MeshBasicMaterial({
+          color: 0x4ea8ff, wireframe: true, transparent: true, opacity: 0.07,
+          blending: THREE.AdditiveBlending, depthWrite: false,
+        })
+      );
+      wire.position.set(c.cx, c.cy, c.cz);
+      zoneGroup.add(wire);
+      const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glowTex, color: 0x2a6cc0, transparent: true, opacity: 0.16,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }));
+      halo.position.set(c.cx, c.cy, c.cz);
+      halo.scale.set(c.r * 1.6, c.r * 1.6, 1);
+      zoneGroup.add(halo);
+    }
+  }
+
+  // ---------- Collision FX pool ----------
+  const COLL_POOL = 48, LABEL_POOL = 6;
+  const collSprites = [];
+  for (let i = 0; i < COLL_POOL; i++) {
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: ringTex, color: 0xff5a5a, transparent: true, opacity: 0,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    }));
+    sp.visible = false;
+    world.add(sp);
+    collSprites.push(sp);
+  }
+  const collLabels = [];
+  for (let i = 0; i < LABEL_POOL; i++) {
+    const div = document.createElement('div');
+    div.className = 'coll-label';
+    div.textContent = 'BIT COLLISION · FEATURE OVERWRITTEN';
+    const obj = new CSS2DObject(div);
+    obj.visible = false;
+    world.add(obj);
+    collLabels.push(obj);
+  }
+  let collCursor = 0, labelCursor = 0;
+
+  // ---------- Post-processing ----------
+  const composer = new EffectComposer(renderer);
+  const renderPass = new RenderPass(scene, camera);
+  const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 1.0, 0.55, 0.12);
+  const outputPass = new OutputPass();
+  composer.addPass(renderPass);
+  composer.addPass(bloomPass);
+  composer.addPass(outputPass);
+
   // ---------- Sizing ----------
   function resize() {
-    dpr = Math.min(window.devicePixelRatio || 1, 2);
     const r = stage.getBoundingClientRect();
-    W = Math.max(200, r.width);
-    H = Math.max(200, r.height);
-    canvas.width = Math.floor(W * dpr);
-    canvas.height = Math.floor(H * dpr);
-    canvas.style.width = W + 'px';
-    canvas.style.height = H + 'px';
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    seedClusters();
+    const w = Math.max(200, r.width), h = Math.max(200, r.height);
+    renderer.setSize(w, h);
+    composer.setSize(w, h);
+    labelRenderer.setSize(w, h);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
   }
   window.addEventListener('resize', resize);
-
-  // ---------- Helpers ----------
-  const rand = (a, b) => a + Math.random() * (b - a);
-  const TAU = Math.PI * 2;
 
   // ---------- Clusters ----------
   function seedClusters() {
     clusters.length = 0;
-    // number of feature clusters derived from density (8..24)
     const n = Math.max(6, Math.round(8 + config.density * 16));
-    // tightness driven by correlation: high corr -> tight cluster radii
-    const tight = 0.15 + (1 - config.correlation) * 0.7; // radius factor
+    const tight = 0.15 + (1 - config.correlation) * 0.7;
     for (let i = 0; i < n; i++) {
-      const cx = rand(W * 0.08, W * 0.92);
-      const cy = rand(H * 0.08, H * 0.92);
-      const r = Math.max(18, Math.min(W, H) * tight * rand(0.6, 1.1));
-      clusters.push({ cx, cy, r });
+      clusters.push({
+        cx: rand(-WORLD.w * 0.4, WORLD.w * 0.4),
+        cy: rand(-WORLD.h * 0.38, WORLD.h * 0.38),
+        cz: rand(-WORLD.d * 0.38, WORLD.d * 0.38),
+        r: Math.max(24, Math.min(WORLD.w, WORLD.h) * tight * rand(0.35, 0.6)),
+      });
     }
+    rebuildZoneMeshes();
   }
 
+  const randInSphere = (r) => {
+    // uniform-ish random point in sphere radius r
+    let x, y, z, m;
+    do { x = rand(-1, 1); y = rand(-1, 1); z = rand(-1, 1); m = x * x + y * y + z * z; } while (m > 1 || m < 1e-6);
+    const s = r * Math.cbrt(Math.random()) / Math.sqrt(m);
+    return { x: x * s, y: y * s, z: z * s };
+  };
+
+  function newTargetOpt(c) {
+    const p = randInSphere(c.r);
+    return new THREE.Vector3(c.cx + p.x, c.cy + p.y, c.cz + p.z);
+  }
+
+  const randomVolumePoint = () => new THREE.Vector3(
+    rand(-WORLD.w / 2, WORLD.w / 2),
+    rand(-WORLD.h / 2, WORLD.h / 2),
+    rand(-WORLD.d / 2, WORLD.d / 2)
+  );
+
   // ---------- Snake factory ----------
+  const tmpColor = new THREE.Color();
   function makeSnake(id) {
     const opt = config.mode === 'optimized';
+    let s;
     if (opt) {
       const c = clusters[id % clusters.length];
-      const a = rand(0, TAU);
-      const rr = rand(0, c.r);
-      return {
+      const p = randInSphere(c.r);
+      const hue = 200 + (id % 2) * -55 + rand(-12, 12); // blues ~200 / greens ~145
+      s = {
         id, opt: true,
-        x: c.cx + Math.cos(a) * rr,
-        y: c.cy + Math.sin(a) * rr,
-        angle: rand(0, TAU),
+        pos: new THREE.Vector3(c.cx + p.x, c.cy + p.y, c.cz + p.z),
+        dir: randomVolumePoint().normalize(),
         clusterId: id % clusters.length,
         zone: c,
-        hue: (200 + (id % 2) * -55 + rand(-12, 12)), // blues ~200 / greens ~145
-        sat: 55 + rand(-10, 10),
-        light: 60 + rand(-8, 8),
+        hue, sat: 55 + rand(-10, 10), light: 60 + rand(-8, 8),
         tailLen: 3 + Math.floor(rand(0, 6)),   // 3..8
         tail: [],
         target: newTargetOpt(c),
         pausedUntil: 0,
         speed: rand(0.7, 1.2),
-        seed: Math.random() * 1000,
       };
     } else {
-      const hue = rand(0, 360);
-      return {
+      s = {
         id, opt: false,
-        x: rand(0, W), y: rand(0, H),
-        angle: rand(0, TAU),
+        pos: randomVolumePoint(),
+        dir: randomVolumePoint().normalize(),
         clusterId: -1, zone: null,
-        hue, sat: 90, light: 60,
+        hue: rand(0, 360), sat: 90, light: 60,
         tailLen: 20 + Math.floor(rand(0, 21)), // 20..40
         tail: [],
-        target: { x: rand(0, W), y: rand(0, H) },
+        target: randomVolumePoint(),
         pausedUntil: 0,
         speed: rand(0.9, 1.6),
-        seed: Math.random() * 1000,
       };
     }
-  }
-
-  function newTargetOpt(c) {
-    const a = rand(0, TAU), r = rand(0, c.r);
-    return { x: c.cx + Math.cos(a) * r, y: c.cy + Math.sin(a) * r };
+    tmpColor.setHSL(((s.hue % 360) + 360) % 360 / 360, s.sat / 100, s.light / 100);
+    s.r = tmpColor.r; s.g = tmpColor.g; s.b = tmpColor.b;
+    return s;
   }
 
   // ---------- Rebuild population ----------
   function rebuild() {
     if (clusters.length === 0) seedClusters();
     const n = config.agentCount;
-    if (snakes.length === n && snakes[0] && snakes[0].opt === (config.mode === 'optimized')) {
-      return; // nothing structural changed
-    }
-    // if mode changed, full rebuild; else resize
-    const sameMode = snakes.length > 0 && snakes[0].opt === (config.mode === 'optimized');
+    const opt = config.mode === 'optimized';
+    if (snakes.length === n && snakes[0] && snakes[0].opt === opt) return;
+    const sameMode = snakes.length > 0 && snakes[0].opt === opt;
     if (!sameMode) {
       snakes = [];
       for (let i = 0; i < n; i++) snakes.push(makeSnake(i));
-    } else {
-      if (n > snakes.length) {
-        for (let i = snakes.length; i < n; i++) snakes.push(makeSnake(i));
-      } else if (n < snakes.length) {
-        snakes.length = n;
-      }
+    } else if (n > snakes.length) {
+      for (let i = snakes.length; i < n; i++) snakes.push(makeSnake(i));
+    } else if (n < snakes.length) {
+      snakes.length = n;
+    }
+  }
+
+  function reassignZones() {
+    for (const s of snakes) {
+      if (s.opt) s.zone = clusters[s.clusterId % clusters.length];
     }
   }
 
   // ---------- Update ----------
+  const desired = new THREE.Vector3();
   function update(dt, now) {
-    const speed = config.speed;
-    const step = dt * speed; // ms scaled
+    const step = dt * config.speed; // ms scaled
 
-    for (let i = 0; i < snakes.length; i++) {
-      const s = snakes[i];
+    for (const s of snakes) {
       if (now < s.pausedUntil) continue;
 
       if (s.opt) {
-        // steer toward target inside zone
-        const dx = s.target.x - s.x, dy = s.target.y - s.y;
-        const d = Math.hypot(dx, dy);
-        if (d < 6) s.target = newTargetOpt(s.zone);
-        const desired = Math.atan2(dy, dx);
-        s.angle = lerpAngle(s.angle, desired, 0.12);
-        // mild jitter so it doesn't look mechanical
-        s.angle += Math.sin(now * 0.002 + s.seed) * 0.02;
-        const v = 0.04 * s.speed;
-        s.x += Math.cos(s.angle) * v * step;
-        s.y += Math.sin(s.angle) * v * step;
+        desired.copy(s.target).sub(s.pos);
+        const d = desired.length();
+        if (d < 8) { s.target.copy(newTargetOpt(s.zone)); desired.copy(s.target).sub(s.pos); }
+        desired.normalize();
+        s.dir.lerp(desired, 0.09);
+        // mild organic jitter
+        s.dir.x += Math.sin(now * 0.002 + s.id * 1.7) * 0.012;
+        s.dir.y += Math.cos(now * 0.0016 + s.id * 2.3) * 0.012;
+        s.dir.z += Math.sin(now * 0.0018 + s.id * 0.9) * 0.012;
+        s.dir.normalize();
+        const v = 0.045 * s.speed * step;
+        s.pos.addScaledVector(s.dir, v);
         // clamp to zone
-        const rx = s.x - s.zone.cx, ry = s.y - s.zone.cy;
-        const rd = Math.hypot(rx, ry);
+        desired.set(s.pos.x - s.zone.cx, s.pos.y - s.zone.cy, s.pos.z - s.zone.cz);
+        const rd = desired.length();
         if (rd > s.zone.r) {
-          s.x = s.zone.cx + (rx / rd) * s.zone.r * 0.95;
-          s.y = s.zone.cy + (ry / rd) * s.zone.r * 0.95;
-          s.target = newTargetOpt(s.zone);
+          desired.multiplyScalar((s.zone.r * 0.95) / rd);
+          s.pos.set(s.zone.cx + desired.x, s.zone.cy + desired.y, s.zone.cz + desired.z);
+          s.target.copy(newTargetOpt(s.zone));
         }
       } else {
-        // pick a fresh random target frequently
-        if (Math.random() < 0.04) {
-          s.target.x = rand(0, W);
-          s.target.y = rand(0, H);
-        }
-        const dx = s.target.x - s.x, dy = s.target.y - s.y;
-        const desired = Math.atan2(dy, dx);
-        s.angle = lerpAngle(s.angle, desired + rand(-0.6, 0.6), 0.25); // erratic
-        const v = 0.06 * s.speed;
-        s.x += Math.cos(s.angle) * v * step;
-        s.y += Math.sin(s.angle) * v * step;
-        if (s.x < 0) { s.x = 0; s.target.x = rand(0, W); }
-        if (s.x > W) { s.x = W; s.target.x = rand(0, W); }
-        if (s.y < 0) { s.y = 0; s.target.y = rand(0, H); }
-        if (s.y > H) { s.y = H; s.target.y = rand(0, H); }
+        // fresh random target frequently, erratic steering
+        if (Math.random() < 0.04) s.target.copy(randomVolumePoint());
+        desired.copy(s.target).sub(s.pos).normalize();
+        s.dir.lerp(desired, 0.18);
+        s.dir.x += rand(-0.09, 0.09);
+        s.dir.y += rand(-0.09, 0.09);
+        s.dir.z += rand(-0.09, 0.09);
+        s.dir.normalize();
+        const v = 0.07 * s.speed * step;
+        s.pos.addScaledVector(s.dir, v);
+        // bounce off volume walls
+        if (Math.abs(s.pos.x) > WORLD.w / 2) { s.pos.x = Math.sign(s.pos.x) * WORLD.w / 2; s.dir.x *= -1; }
+        if (Math.abs(s.pos.y) > WORLD.h / 2) { s.pos.y = Math.sign(s.pos.y) * WORLD.h / 2; s.dir.y *= -1; }
+        if (Math.abs(s.pos.z) > WORLD.d / 2) { s.pos.z = Math.sign(s.pos.z) * WORLD.d / 2; s.dir.z *= -1; }
       }
 
       // tail
-      s.tail.push(s.x, s.y);
-      const maxLen = s.tailLen * 2;
-      if (s.tail.length > maxLen) {
-        s.tail.splice(0, s.tail.length - maxLen);
-      }
+      s.tail.push(s.pos.x, s.pos.y, s.pos.z);
+      const maxLen = s.tailLen * 3;
+      if (s.tail.length > maxLen) s.tail.splice(0, s.tail.length - maxLen);
     }
   }
 
-  function lerpAngle(a, b, t) {
-    let diff = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
-    return a + diff * t;
-  }
-
-  // ---------- Collision detection (spatial hash) ----------
+  // ---------- Collision detection (3D spatial hash) ----------
   function detectCollisions(now) {
-    const cell = 14;
+    const cell = 16;
     const grid = new Map();
-    const proximity = config.mode === 'optimized' ? 6 : 5;
+    const proximity = config.mode === 'optimized' ? 7 : 6;
+    const prox2 = proximity * proximity;
 
-    // probability that an overlap actually registers as a bit collision
-    // naive: scales with density (more features packed -> more clashes)
-    // optimized: only when density forces bits < features (density > ~0.75)
     let pCollide;
     if (config.mode === 'naive') {
       pCollide = 0.02 + config.density * 0.10;
     } else {
-      // protocol has headroom until schema saturates; above ~75% density it spikes
       const over = Math.max(0, (config.density - 0.7) / 0.3);
       pCollide = 0.004 + over * 0.06 * (1 - config.correlation * 0.4);
     }
 
-    for (let i = 0; i < snakes.length; i++) {
-      const s = snakes[i];
-      const cx = (s.x / cell) | 0, cy = (s.y / cell) | 0;
-      for (let gx = cx - 1; gx <= cx + 1; gx++) {
-        for (let gy = cy - 1; gy <= cy + 1; gy++) {
-          const key = gx + ',' + gy;
-          const bucket = grid.get(key);
-          if (!bucket) continue;
-          for (let b = 0; b < bucket.length; b++) {
-            const o = bucket[b];
-            if (o.id >= s.id) continue;
-            const dx = o.x - s.x, dy = o.y - s.y;
-            if (dx * dx + dy * dy < proximity * proximity) {
-              if (Math.random() < pCollide) {
-                registerCollision((s.x + o.x) / 2, (s.y + o.y) / 2, s, o, now);
+    for (const s of snakes) {
+      const cx = Math.floor(s.pos.x / cell), cy = Math.floor(s.pos.y / cell), cz = Math.floor(s.pos.z / cell);
+      for (let gx = cx - 1; gx <= cx + 1; gx++)
+        for (let gy = cy - 1; gy <= cy + 1; gy++)
+          for (let gz = cz - 1; gz <= cz + 1; gz++) {
+            const bucket = grid.get(gx + ',' + gy + ',' + gz);
+            if (!bucket) continue;
+            for (const o of bucket) {
+              if (o.id >= s.id) continue;
+              const dx = o.pos.x - s.pos.x, dy = o.pos.y - s.pos.y, dz = o.pos.z - s.pos.z;
+              if (dx * dx + dy * dy + dz * dz < prox2 && Math.random() < pCollide) {
+                registerCollision(
+                  (s.pos.x + o.pos.x) / 2, (s.pos.y + o.pos.y) / 2, (s.pos.z + o.pos.z) / 2,
+                  s, o, now
+                );
               }
             }
           }
-        }
-      }
-      const key = cx + ',' + cy;
+      const key = cx + ',' + cy + ',' + cz;
       let bucket = grid.get(key);
       if (!bucket) { bucket = []; grid.set(key, bucket); }
       bucket.push(s);
     }
   }
 
-  function registerCollision(x, y, a, b, now) {
-    collisions.push({ x, y, born: now, tooltip: Math.random() < 0.35 });
+  function registerCollision(x, y, z, a, b, now) {
+    const sprite = collSprites[collCursor];
+    collCursor = (collCursor + 1) % COLL_POOL;
+    let label = null;
+    if (Math.random() < 0.3) {
+      label = collLabels[labelCursor];
+      labelCursor = (labelCursor + 1) % LABEL_POOL;
+      label.position.set(x, y + 12, z);
+      label.visible = true;
+    }
+    sprite.position.set(x, y, z);
+    sprite.visible = true;
+    collisions.push({ sprite, label, born: now });
     a.pausedUntil = Math.max(a.pausedUntil, now + 500);
     b.pausedUntil = Math.max(b.pausedUntil, now + 500);
     collideCountWindow++;
+  }
+
+  function updateCollisionFX(now) {
+    for (let i = collisions.length - 1; i >= 0; i--) {
+      const c = collisions[i];
+      const age = now - c.born;
+      if (age > 900) {
+        c.sprite.visible = false;
+        if (c.label) c.label.visible = false;
+        collisions.splice(i, 1);
+        continue;
+      }
+      const t = age / 900;
+      const sz = 8 + t * 30;
+      c.sprite.scale.set(sz, sz, 1);
+      c.sprite.material.opacity = 1 - t;
+      if (c.label) {
+        c.label.element.style.opacity = String(age < 800 ? (1 - age / 800) : 0);
+        c.label.position.y += 0.04;
+      }
+    }
   }
 
   // ---------- Synthetic naive overhead (intentional) ----------
@@ -497,147 +772,75 @@
     if (config.mode !== 'naive') return;
     const n = snakes.length;
     if (n < 250) return;
-    // extra work proportional to (n - 250)
     const iters = Math.floor((n - 250) * 2.2);
     let acc = 0;
-    // string-build emulation (allocations) — kept bounded
     for (let i = 0; i < iters; i++) {
       acc += (i * 7 + (i & 3)) % 13;
     }
-    // touch to avoid dead-code elimination
     if (acc === -1) console.log(acc);
   }
 
-  // ---------- Rendering ----------
-  function clearWithTrail() {
-    // translucent fill leaves subtle motion trails
-    ctx.fillStyle = config.mode === 'naive' ? 'rgba(10,10,15,0.28)' : 'rgba(8,12,18,0.34)';
-    ctx.fillRect(0, 0, W, H);
-  }
-
-  function drawGrid() {
-    const g = 48;
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = config.mode === 'naive' ? 'rgba(255,255,255,0.025)' : 'rgba(78,168,255,0.05)';
-    ctx.beginPath();
-    for (let x = (W % g) / 2; x < W; x += g) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
-    for (let y = (H % g) / 2; y < H; y += g) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
-    ctx.stroke();
-
-    // zone outlines (optimized mode)
-    if (config.mode === 'optimized') {
-      ctx.strokeStyle = 'rgba(78,168,255,0.08)';
-      ctx.lineWidth = 1;
-      for (let i = 0; i < clusters.length; i++) {
-        const c = clusters[i];
-        ctx.beginPath();
-        ctx.arc(c.cx, c.cy, c.r, 0, TAU);
-        ctx.stroke();
+  // ---------- Fill GPU buffers ----------
+  function fillBuffers(now) {
+    const tp = tailGeo.attributes.position.array;
+    const tc = tailGeo.attributes.color.array;
+    let v = 0; // vertex float cursor
+    for (const s of snakes) {
+      const t = s.tail, n = (t.length / 3) | 0;
+      if (n < 2) continue;
+      const segs = n - 1;
+      const dim = now < s.pausedUntil ? 0.3 : 1;
+      for (let k = 0; k < segs; k++) {
+        const f0 = k / segs, f1 = (k + 1) / segs;   // 0 tail .. 1 head
+        const a0 = (0.03 + f0 * f0 * 0.95) * dim;
+        const a1 = (0.03 + f1 * f1 * 0.95) * dim;
+        const i3 = k * 3;
+        tp[v] = t[i3];     tp[v + 1] = t[i3 + 1]; tp[v + 2] = t[i3 + 2];
+        tc[v] = s.r * a0;  tc[v + 1] = s.g * a0;  tc[v + 2] = s.b * a0;
+        v += 3;
+        tp[v] = t[i3 + 3]; tp[v + 1] = t[i3 + 4]; tp[v + 2] = t[i3 + 5];
+        tc[v] = s.r * a1;  tc[v + 1] = s.g * a1;  tc[v + 2] = s.b * a1;
+        v += 3;
       }
     }
-  }
+    tailGeo.setDrawRange(0, v / 3);
+    tailGeo.attributes.position.needsUpdate = true;
+    tailGeo.attributes.color.needsUpdate = true;
 
-  function drawSnakes(now) {
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    for (let i = 0; i < snakes.length; i++) {
-      const s = snakes[i];
-      const paused = now < s.pausedUntil;
-      const baseAlpha = paused ? 0.35 : 1;
-
-      // tail polyline with fading width/alpha
-      const pts = s.tail;
-      const segs = pts.length / 2 - 1;
-      if (segs >= 1) {
-        for (let k = 0; k < segs; k++) {
-          const f = k / segs;        // 0 tail .. 1 head
-          const a = (0.06 + f * 0.6) * baseAlpha;
-          ctx.strokeStyle = `hsla(${s.hue},${s.sat}%,${s.light}%,${a})`;
-          ctx.lineWidth = (s.opt ? 1.4 : 1.6) + f * (s.opt ? 1.6 : 2.6);
-          ctx.beginPath();
-          ctx.moveTo(pts[k * 2], pts[k * 2 + 1]);
-          ctx.lineTo(pts[k * 2 + 2], pts[k * 2 + 3]);
-          ctx.stroke();
-        }
-      }
-      // head
-      ctx.fillStyle = `hsla(${s.hue},${s.sat}%,${Math.min(80, s.light + 10)}%,${baseAlpha})`;
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, s.opt ? 2.4 : 3.0, 0, TAU);
-      ctx.fill();
+    const hp = headGeo.attributes.position.array;
+    const hc = headGeo.attributes.color.array;
+    let h = 0;
+    for (const s of snakes) {
+      const dim = now < s.pausedUntil ? 0.3 : 1;
+      const boost = 1.35 * dim;
+      hp[h] = s.pos.x; hp[h + 1] = s.pos.y; hp[h + 2] = s.pos.z;
+      hc[h] = Math.min(1, s.r * boost);
+      hc[h + 1] = Math.min(1, s.g * boost);
+      hc[h + 2] = Math.min(1, s.b * boost);
+      h += 3;
     }
-  }
-
-  function drawCollisions(now) {
-    for (let i = collisions.length - 1; i >= 0; i--) {
-      const c = collisions[i];
-      const age = now - c.born;
-      if (age > 900) { collisions.splice(i, 1); continue; }
-      const t = age / 900;
-      const a = 1 - t;
-      const sz = 6 + t * 8;
-      ctx.strokeStyle = `rgba(255,90,90,${a})`;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(c.x - sz, c.y - sz); ctx.lineTo(c.x + sz, c.y + sz);
-      ctx.moveTo(c.x + sz, c.y - sz); ctx.lineTo(c.x - sz, c.y + sz);
-      ctx.stroke();
-
-      // DATA LOSS text briefly
-      if (age < 450) {
-        ctx.fillStyle = `rgba(255,90,90,${a})`;
-        ctx.font = '700 9px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('DATA LOSS', c.x, c.y - sz - 4);
-      }
-      // tooltip on a subset
-      if (c.tooltip && age < 800) {
-        ctx.fillStyle = `rgba(255,200,200,${a * 0.9})`;
-        ctx.font = '8px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText('BIT COLLISION: Feature Overwritten', c.x, c.y + sz + 10);
-      }
-    }
-    ctx.textAlign = 'start';
-  }
-
-  function render(now) {
-    clearWithTrail();
-    drawGrid();
-    drawSnakes(now);
-    drawCollisions(now);
+    headGeo.setDrawRange(0, snakes.length);
+    headGeo.attributes.position.needsUpdate = true;
+    headGeo.attributes.color.needsUpdate = true;
   }
 
   // ---------- Metrics ----------
   function computeHamming() {
-    // cheap proxy: average pairwise distance of snake heads from canvas center,
-    // quantized to "bits". Optimized -> small (clustered); Naive -> large.
+    // proxy: average distance of snake heads from volume center, mapped to 0..64 "bits"
     if (snakes.length === 0) return 0;
     let sum = 0;
-    const cx = W / 2, cy = H / 2;
-    const norm = Math.hypot(W, H) / 2;
-    for (let i = 0; i < snakes.length; i++) {
-      const s = snakes[i];
-      const d = Math.hypot(s.x - cx, s.y - cy) / norm; // 0..1
-      sum += d;
-    }
-    const avg = sum / snakes.length;            // 0..1
-    const bits = Math.round(avg * 64);          // map to "bit distance" 0..64
-    return bits;
+    const norm = Math.hypot(WORLD.w, WORLD.h, WORLD.d) / 2;
+    for (const s of snakes) sum += s.pos.length() / norm;
+    return Math.round((sum / snakes.length) * 64);
   }
 
   function computeBandwidth() {
-    // Optimized: fixed 24 bytes/agent (3x uint64 bitmask).
-    // Naive: scales with density (features) and per-feature overhead (key+value+quotes+delims).
-    if (config.mode === 'optimized') return 24;
-    // ~ features per agent = density * 32 ; each ~ 14 bytes avg (key=val,)
+    if (config.mode === 'optimized') return 24; // fixed 3x uint64 bitmask
     const features = Math.max(1, Math.round(config.density * 32));
-    const framing = 6; // braces, newlines
-    return framing + features * 14;
+    return 6 + features * 14;
   }
 
   function updateMetricsDOM(now) {
-    // rolling collisions/sec
     if (now - lastSecMark >= 1000) {
       collisionsPerSec = collideCountWindow;
       collideCountWindow = 0;
@@ -649,19 +852,15 @@
     $('mFps').textContent = Math.round(fpsEMA);
     $('mHamming').innerHTML = hamming + '<span class="u">bits</span>';
     $('mColl').textContent = collisionsPerSec;
-    $('mBw').textContent = bw;
-    $('mBwU').textContent = bw >= 1024 ? ' KB' : ' B';
-    if (bw >= 1024) $('mBw').textContent = (bw / 1024).toFixed(1);
-    // bandwidth bar relative to ~512B cap
+    if (bw >= 1024) { $('mBw').textContent = (bw / 1024).toFixed(1); $('mBwU').textContent = ' KB'; }
+    else { $('mBw').textContent = bw; $('mBwU').textContent = ' B'; }
     const bwPct = Math.min(100, (bw / 512) * 100);
     $('mBwBar').style.width = bwPct + '%';
     $('mBwBar').style.background = config.mode === 'optimized' ? 'var(--accent2)' : 'var(--naive)';
 
-    // saturation
     const saturated = (config.mode === 'naive' && (fpsEMA < 30 || collisionsPerSec > 40));
     $('saturation').classList.toggle('on', saturated);
 
-    // educational message
     updateMessage();
   }
 
@@ -683,19 +882,52 @@
     el.innerHTML = html;
   }
 
+  // ---------- Mode-dependent scene dressing ----------
+  function applyModeLook() {
+    if (config.mode === 'optimized') {
+      grid.material.color.setHex(0x2a4a6e);
+      boundsBox.material.color.setHex(0x4ea8ff);
+      bloomPass.strength = 0.95;
+      headMat.size = 5;
+    } else {
+      grid.material.color.setHex(0x2a2a3d);
+      boundsBox.material.color.setHex(0x8888aa);
+      bloomPass.strength = 1.1;
+      headMat.size = 6.5;
+    }
+    rebuildZoneMeshes();
+  }
+
   // ---------- Main loop ----------
   function frame(now) {
     let dt = now - lastT;
-    if (dt > 60) dt = 60;        // clamp tab-switch spikes
+    if (dt > 60) dt = 60; // clamp tab-switch spikes
     lastT = now;
-    frameMs = frameMs * 0.9 + dt * 0.1;
     const inst = 1000 / Math.max(1, dt);
     fpsEMA = fpsEMA * 0.92 + inst * 0.08;
+
+    // idle sway (positional only — camera never rotates), eases off while interacting
+    swayAmp += ((interacting ? 0 : 1) - swayAmp) * 0.03;
+    world.position.x = Math.sin(now * 0.00013) * 6 * swayAmp;
+    world.position.y = Math.cos(now * 0.00009) * 4 * swayAmp;
+
+    // pan only unlocks once zoomed in; ease back to center at full zoom-out
+    const dist = controls.getDistance();
+    controls.enablePan = dist < controls.maxDistance - 30;
+    if (!controls.enablePan) controls.target.lerp(PAN_ZERO, 0.06);
+    controls.target.clamp(PAN_MIN, PAN_LIMIT);
+    controls.update();
+
+    dust.rotation.y += dt * 0.00002;
 
     naiveOverhead();
     update(dt, now);
     detectCollisions(now);
-    render(now);
+    updateCollisionFX(now);
+    fillBuffers(now);
+
+    composer.render();
+    labelRenderer.render(scene, camera);
     updateMetricsDOM(now);
 
     requestAnimationFrame(frame);
@@ -718,7 +950,6 @@
     rebuild();
   });
   bindRange('density', 'density', v => Math.round(v * 100) + '%', v => v / 100, () => {
-    // density affects clusters (count + collision probability)
     seedClusters();
     if (config.mode === 'optimized') reassignZones();
   });
@@ -728,37 +959,27 @@
   });
   bindRange('speed', 'speed', v => v.toFixed(1) + '×', v => v / 100);
 
-  function reassignZones() {
-    for (let i = 0; i < snakes.length; i++) {
-      const s = snakes[i];
-      const c = clusters[s.clusterId % clusters.length];
-      s.zone = c;
-    }
-  }
-
   // mode toggle
   document.querySelectorAll('#modeToggle button').forEach(btn => {
     btn.addEventListener('click', () => {
       cancelDemo();
-      const m = btn.getAttribute('data-mode');
-      config.mode = m;
+      config.mode = btn.getAttribute('data-mode');
       document.querySelectorAll('#modeToggle button').forEach(b => {
         b.setAttribute('data-active', b === btn ? 'true' : 'false');
       });
-      // force full rebuild
       snakes = [];
+      applyModeLook();
       rebuild();
     });
   });
 
   // ---------- Saturation demo ----------
-  let demoRAF = 0, demoStart = 0, demoFrom = 10, demoActive = false;
+  let demoRAF = 0, demoStart = 0, demoActive = false;
   const DEMO_MS = 12000;
   function startDemo() {
     if (demoActive) { cancelDemo(); return; }
     demoActive = true;
     demoStart = performance.now();
-    demoFrom = config.agentCount;
     $('demoBtn').setAttribute('data-running', 'true');
     $('demoBtn').textContent = '■ STOP DEMO';
     // start in naive mode for dramatic contrast
@@ -768,6 +989,7 @@
         b.setAttribute('data-active', b.getAttribute('data-mode') === 'naive' ? 'true' : 'false');
       });
       snakes = [];
+      applyModeLook();
     }
     demoLoop(demoStart);
   }
@@ -793,6 +1015,8 @@
 
   // ---------- Boot ----------
   resize();
+  seedClusters();
+  applyModeLook();
   rebuild();
   requestAnimationFrame(frame);
 })();
