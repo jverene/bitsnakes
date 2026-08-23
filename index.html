@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Snake Protocol — Information Theory Visualizer</title>
+<title>Bitsnakes — Information Theory Visualizer</title>
 <style>
   :root {
     --bg: #0a0a0f;
@@ -202,16 +202,16 @@
   <div id="stage">
     <div id="sim"></div>
     <div id="stageHead">
-      <div class="t1">SNAKE PROTOCOL // LIVE</div>
-      <div class="t2">each snake = one agent's state vector over time</div>
+      <div class="t1">BITSNAKES // LIVE</div>
+      <div class="t2">each snake = one agent's state vector · every voxel = one bit</div>
     </div>
     <div id="stageHint">SCROLL · ZOOM&ensp;—&ensp;DRAG · PAN</div>
   </div>
 
   <aside id="panel">
     <div class="brand">
-      <h1>SNAKE PROTOCOL</h1>
-      <small>v2.0 · webgl</small>
+      <h1>BITSNAKES</h1>
+      <small>v3.0 · voxel</small>
     </div>
 
     <div class="group">
@@ -299,21 +299,41 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     speed: 1.0,      // 0.25..3
   };
 
-  // ---------- World ----------
-  const WORLD = { w: 920, h: 540, d: 400 };
-  const MAX_AGENTS = 1000, MAX_TAIL = 40;
-  const TAU = Math.PI * 2;
+  // ---------- Grid ----------
+  // The playfield is a side×side lattice of voxel bits. Snakes move one cell
+  // per tick, axis-aligned only (classic snake rules), rendered in 3D.
+  const TICK_MS = 150;          // one cell per 150ms at 1× speed
+  const MAX_SIDE = 128;
+  const MAX_SNAKE_INST = 42000; // 1000 agents × up to 40 body cells + margin
+  const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]]; // +x, +z, -x, -z
   const rand = (a, b) => a + Math.random() * (b - a);
+  const randInt = (a, b) => Math.floor(rand(a, b + 1));
+
+  // grid side grows sub-linearly with agent count so naive mode spatially
+  // saturates at scale while small N stays calm
+  let side = 0;
+  function sideFor(n) {
+    return Math.min(MAX_SIDE, Math.round(90 + (Math.log10(Math.max(10, n)) - 1) / 2 * 30));
+  }
 
   // ---------- State ----------
   let snakes = [];
-  let collisions = [];            // { pos, born, sprite, label }
-  let clusters = [];              // { cx,cy,cz,r }
+  let zones = [];               // {cx,cz,half} in cell coords
+  let occ = new Map();          // cellKey -> {id, n}
+  let bitVal = new Float32Array(0);   // pulse brightness per cell
+  let bitHue = new Float32Array(0);   // hue of last occupant per cell
+  let bitSat = new Float32Array(0);
+  let bitWritten = new Float32Array(0); // last value pushed to GPU
+  let collisions = [];          // {x,z,born,label}
   let lastT = performance.now();
   let fpsEMA = 60;
   let collideCountWindow = 0;
   let collisionsPerSec = 0;
   let lastSecMark = performance.now();
+
+  const key = (x, z) => x + z * side;
+  const worldX = cx => cx - side / 2 + 0.5;
+  const worldZ = cz => cz - side / 2 + 0.5;
 
   // ---------- Renderer / Scene ----------
   const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
@@ -328,15 +348,11 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0a0a0f);
-  scene.fog = new THREE.FogExp2(0x0a0a0f, 0.00032);
+  scene.fog = new THREE.FogExp2(0x0a0a0f, 0.0016);
 
-  const camera = new THREE.PerspectiveCamera(50, 1, 1, 6000);
-  camera.position.set(0, 480, 1080);
-  camera.lookAt(0, 0, 0);
-
-  // world group: idle sway moves this, never the camera (no rotation allowed)
-  const world = new THREE.Group();
-  scene.add(world);
+  const camera = new THREE.PerspectiveCamera(32, 1, 1, 4000);
+  const ISO_DIR = new THREE.Vector3(1, 1.15, 1).normalize(); // fixed isometric-ish angle
+  let camDist = 220;
 
   // ---------- Controls: zoom + pan only, no orbiting ----------
   const controls = new OrbitControls(camera, renderer.domElement);
@@ -344,123 +360,44 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.screenSpacePanning = true;
-  controls.minDistance = 260;
-  controls.maxDistance = 1500;
   controls.zoomSpeed = 0.9;
-  controls.target.set(0, 0, 0);
 
-  let interacting = false, swayAmp = 1;
-  controls.addEventListener('start', () => { interacting = true; });
-  controls.addEventListener('end', () => { interacting = false; });
+  // ---------- Lights ----------
+  scene.add(new THREE.HemisphereLight(0x8fb4ff, 0x0a0a12, 0.85));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
+  dirLight.position.set(0.5, 1, 0.35);
+  scene.add(dirLight);
 
-  const PAN_LIMIT = new THREE.Vector3(WORLD.w * 0.5, WORLD.h * 0.5, WORLD.d * 0.5);
-  const PAN_MIN = PAN_LIMIT.clone().negate();
-  const PAN_ZERO = new THREE.Vector3(0, 0, 0);
+  // ---------- Bit field (one voxel per bit) ----------
+  const bitGeo = new THREE.BoxGeometry(0.88, 0.22, 0.88);
+  const bitMesh = new THREE.InstancedMesh(bitGeo,
+    new THREE.MeshBasicMaterial({ color: 0xffffff }), MAX_SIDE * MAX_SIDE);
+  bitMesh.frustumCulled = false;
+  bitMesh.count = 0;
+  scene.add(bitMesh);
 
-  // ---------- Textures ----------
-  function makeGlowTexture() {
-    const c = document.createElement('canvas');
-    c.width = c.height = 64;
-    const g = c.getContext('2d');
-    const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
-    grad.addColorStop(0, 'rgba(255,255,255,1)');
-    grad.addColorStop(0.35, 'rgba(255,255,255,0.55)');
-    grad.addColorStop(1, 'rgba(255,255,255,0)');
-    g.fillStyle = grad;
-    g.fillRect(0, 0, 64, 64);
-    const t = new THREE.CanvasTexture(c);
-    t.colorSpace = THREE.SRGBColorSpace;
-    return t;
-  }
-  function makeRingTexture() {
-    const c = document.createElement('canvas');
-    c.width = c.height = 64;
-    const g = c.getContext('2d');
-    g.strokeStyle = 'rgba(255,120,120,1)';
-    g.lineWidth = 5;
-    g.beginPath();
-    g.arc(32, 32, 26, 0, TAU);
-    g.stroke();
-    g.strokeStyle = 'rgba(255,255,255,0.9)';
-    g.lineWidth = 2;
-    g.beginPath();
-    g.arc(32, 32, 26, 0, TAU);
-    g.stroke();
-    const t = new THREE.CanvasTexture(c);
-    t.colorSpace = THREE.SRGBColorSpace;
-    return t;
-  }
-  const glowTex = makeGlowTexture();
-  const ringTex = makeRingTexture();
+  // ---------- Snake bodies / heads ----------
+  const bodyMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.86, 0.86, 0.86),
+    new THREE.MeshLambertMaterial({ color: 0xffffff }), MAX_SNAKE_INST);
+  bodyMesh.frustumCulled = false;
+  bodyMesh.count = 0;
+  scene.add(bodyMesh);
 
-  // ---------- Ambience: dust + grid + bounds ----------
-  const dust = (() => {
-    const N = 700;
-    const pos = new Float32Array(N * 3);
-    for (let i = 0; i < N; i++) {
-      pos[i * 3]     = rand(-WORLD.w * 0.75, WORLD.w * 0.75);
-      pos[i * 3 + 1] = rand(-WORLD.h * 0.75, WORLD.h * 0.75);
-      pos[i * 3 + 2] = rand(-WORLD.d * 1.2, WORLD.d * 0.9);
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    const mat = new THREE.PointsMaterial({
-      size: 1.8, map: glowTex, color: 0x3a4a6e, transparent: true, opacity: 0.45,
-      blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
-    });
-    const pts = new THREE.Points(geo, mat);
-    pts.frustumCulled = false;
-    world.add(pts);
-    return pts;
-  })();
+  const headMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.95, 0.95, 0.95),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }), 1000);
+  headMesh.frustumCulled = false;
+  headMesh.count = 0;
+  scene.add(headMesh);
 
-  const grid = (() => {
-    const g = new THREE.GridHelper(WORLD.w * 1.4, 22, 0x2a2a3d, 0x1a1a2c);
-    g.position.y = -WORLD.h * 0.5;
-    g.material.transparent = true;
-    g.material.opacity = 0.35;
-    g.material.depthWrite = false;
-    world.add(g);
-    return g;
-  })();
+  // ---------- Field frame + zone meshes ----------
+  const frameLines = new THREE.LineSegments(
+    new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ color: 0x4ea8ff, transparent: true, opacity: 0.22, blending: THREE.AdditiveBlending, depthWrite: false })
+  );
+  scene.add(frameLines);
 
-  const boundsBox = (() => {
-    const geo = new THREE.EdgesGeometry(new THREE.BoxGeometry(WORLD.w, WORLD.h, WORLD.d));
-    const mat = new THREE.LineBasicMaterial({
-      color: 0x4ea8ff, transparent: true, opacity: 0.06,
-      blending: THREE.AdditiveBlending, depthWrite: false,
-    });
-    const box = new THREE.LineSegments(geo, mat);
-    world.add(box);
-    return box;
-  })();
-
-  // ---------- Snake buffers (merged, dynamic) ----------
-  const TAIL_VERTS = MAX_AGENTS * (MAX_TAIL - 1) * 2;
-  const tailGeo = new THREE.BufferGeometry();
-  tailGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(TAIL_VERTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
-  tailGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(TAIL_VERTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
-  const tailLines = new THREE.LineSegments(tailGeo, new THREE.LineBasicMaterial({
-    vertexColors: true, transparent: true,
-    blending: THREE.AdditiveBlending, depthWrite: false,
-  }));
-  tailLines.frustumCulled = false;
-  world.add(tailLines);
-
-  const headGeo = new THREE.BufferGeometry();
-  headGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX_AGENTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
-  headGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAX_AGENTS * 3), 3).setUsage(THREE.DynamicDrawUsage));
-  const headMat = new THREE.PointsMaterial({
-    size: 6, map: glowTex, vertexColors: true, transparent: true,
-    blending: THREE.AdditiveBlending, depthWrite: false, sizeAttenuation: true,
-  });
-  const heads = new THREE.Points(headGeo, headMat);
-  heads.frustumCulled = false;
-  world.add(heads);
-
-  // ---------- Zone meshes (optimized mode) ----------
   const zoneGroup = new THREE.Group();
-  world.add(zoneGroup);
+  scene.add(zoneGroup);
 
   function rebuildZoneMeshes() {
     while (zoneGroup.children.length) {
@@ -469,38 +406,36 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
       o.material && o.material.dispose();
     }
     if (config.mode !== 'optimized') return;
-    for (const c of clusters) {
-      const wire = new THREE.Mesh(
-        new THREE.SphereGeometry(c.r, 18, 12),
-        new THREE.MeshBasicMaterial({
-          color: 0x4ea8ff, wireframe: true, transparent: true, opacity: 0.07,
-          blending: THREE.AdditiveBlending, depthWrite: false,
-        })
+    for (const z of zones) {
+      const size = z.half * 2 + 1;
+      const slab = new THREE.Mesh(
+        new THREE.BoxGeometry(size, 0.08, size),
+        new THREE.MeshBasicMaterial({ color: 0x4ea8ff, transparent: true, opacity: 0.05, blending: THREE.AdditiveBlending, depthWrite: false })
       );
-      wire.position.set(c.cx, c.cy, c.cz);
-      zoneGroup.add(wire);
-      const halo = new THREE.Sprite(new THREE.SpriteMaterial({
-        map: glowTex, color: 0x2a6cc0, transparent: true, opacity: 0.16,
-        blending: THREE.AdditiveBlending, depthWrite: false,
-      }));
-      halo.position.set(c.cx, c.cy, c.cz);
-      halo.scale.set(c.r * 1.6, c.r * 1.6, 1);
-      zoneGroup.add(halo);
+      slab.position.set(worldX(z.cx), 0.26, worldZ(z.cz));
+      zoneGroup.add(slab);
+      const edge = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(size, 0.08, size)),
+        new THREE.LineBasicMaterial({ color: 0x4ea8ff, transparent: true, opacity: 0.3, blending: THREE.AdditiveBlending, depthWrite: false })
+      );
+      edge.position.copy(slab.position);
+      zoneGroup.add(edge);
     }
   }
 
-  // ---------- Collision FX pool ----------
-  const COLL_POOL = 48, LABEL_POOL = 6;
-  const collSprites = [];
-  for (let i = 0; i < COLL_POOL; i++) {
-    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
-      map: ringTex, color: 0xff5a5a, transparent: true, opacity: 0,
-      blending: THREE.AdditiveBlending, depthWrite: false,
-    }));
-    sp.visible = false;
-    world.add(sp);
-    collSprites.push(sp);
+  function rebuildFrame() {
+    const h = side / 2 + 0.6, y = 0.12;
+    frameLines.geometry.dispose();
+    frameLines.geometry = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-h, y, -h), new THREE.Vector3(h, y, -h),
+      new THREE.Vector3(h, y, -h), new THREE.Vector3(h, y, h),
+      new THREE.Vector3(h, y, h), new THREE.Vector3(-h, y, h),
+      new THREE.Vector3(-h, y, h), new THREE.Vector3(-h, y, -h),
+    ]);
   }
+
+  // ---------- Collision labels (CSS2D pool) ----------
+  const LABEL_POOL = 8;
   const collLabels = [];
   for (let i = 0; i < LABEL_POOL; i++) {
     const div = document.createElement('div');
@@ -508,19 +443,17 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     div.textContent = 'BIT COLLISION · FEATURE OVERWRITTEN';
     const obj = new CSS2DObject(div);
     obj.visible = false;
-    world.add(obj);
+    scene.add(obj);
     collLabels.push(obj);
   }
-  let collCursor = 0, labelCursor = 0;
+  let labelCursor = 0;
 
   // ---------- Post-processing ----------
   const composer = new EffectComposer(renderer);
-  const renderPass = new RenderPass(scene, camera);
-  const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 1.0, 0.55, 0.12);
-  const outputPass = new OutputPass();
-  composer.addPass(renderPass);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.85, 0.4, 0.6);
   composer.addPass(bloomPass);
-  composer.addPass(outputPass);
+  composer.addPass(new OutputPass());
 
   // ---------- Sizing ----------
   function resize() {
@@ -534,214 +467,204 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
   }
   window.addEventListener('resize', resize);
 
-  // ---------- Clusters ----------
-  function seedClusters() {
-    clusters.length = 0;
+  // ---------- Zones (feature clusters, optimized mode) ----------
+  function seedZones() {
+    zones.length = 0;
     const n = Math.max(6, Math.round(8 + config.density * 16));
-    const tight = 0.15 + (1 - config.correlation) * 0.7;
+    const tiles = Math.ceil(Math.sqrt(n));
+    const tileSide = Math.floor(side / tiles);
+    // correlation shrinks the usable sub-region of each tile (tight clusters)
     for (let i = 0; i < n; i++) {
-      clusters.push({
-        cx: rand(-WORLD.w * 0.4, WORLD.w * 0.4),
-        cy: rand(-WORLD.h * 0.38, WORLD.h * 0.38),
-        cz: rand(-WORLD.d * 0.38, WORLD.d * 0.38),
-        r: Math.max(24, Math.min(WORLD.w, WORLD.h) * tight * rand(0.35, 0.6)),
+      const tx = i % tiles, tz = Math.floor(i / tiles);
+      const sub = Math.max(2, Math.floor(tileSide * (0.35 + (1 - config.correlation) * 0.6) / 2));
+      zones.push({
+        cx: tx * tileSide + Math.floor(tileSide / 2),
+        cz: tz * tileSide + Math.floor(tileSide / 2),
+        half: Math.min(sub, Math.floor(tileSide / 2) - 1),
       });
     }
     rebuildZoneMeshes();
   }
 
-  const randInSphere = (r) => {
-    // uniform-ish random point in sphere radius r
-    let x, y, z, m;
-    do { x = rand(-1, 1); y = rand(-1, 1); z = rand(-1, 1); m = x * x + y * y + z * z; } while (m > 1 || m < 1e-6);
-    const s = r * Math.cbrt(Math.random()) / Math.sqrt(m);
-    return { x: x * s, y: y * s, z: z * s };
-  };
-
-  function newTargetOpt(c) {
-    const p = randInSphere(c.r);
-    return new THREE.Vector3(c.cx + p.x, c.cy + p.y, c.cz + p.z);
+  // ---------- Occupancy ----------
+  function occAdd(k, id) {
+    const e = occ.get(k);
+    if (e) e.n++;
+    else occ.set(k, { id, n: 1 });
   }
-
-  const randomVolumePoint = () => new THREE.Vector3(
-    rand(-WORLD.w / 2, WORLD.w / 2),
-    rand(-WORLD.h / 2, WORLD.h / 2),
-    rand(-WORLD.d / 2, WORLD.d / 2)
-  );
+  function occRemove(k) {
+    const e = occ.get(k);
+    if (!e) return;
+    if (--e.n <= 0) occ.delete(k);
+  }
 
   // ---------- Snake factory ----------
   const tmpColor = new THREE.Color();
   function makeSnake(id) {
     const opt = config.mode === 'optimized';
-    let s;
+    let x, z, tailLen, hue, sat, light, zone = null;
     if (opt) {
-      const c = clusters[id % clusters.length];
-      const p = randInSphere(c.r);
-      const hue = 200 + (id % 2) * -55 + rand(-12, 12); // blues ~200 / greens ~145
-      s = {
-        id, opt: true,
-        pos: new THREE.Vector3(c.cx + p.x, c.cy + p.y, c.cz + p.z),
-        dir: randomVolumePoint().normalize(),
-        clusterId: id % clusters.length,
-        zone: c,
-        hue, sat: 55 + rand(-10, 10), light: 60 + rand(-8, 8),
-        tailLen: 3 + Math.floor(rand(0, 6)),   // 3..8
-        tail: [],
-        target: newTargetOpt(c),
-        pausedUntil: 0,
-        speed: rand(0.7, 1.2),
-      };
+      zone = zones[id % zones.length];
+      x = zone.cx + randInt(-zone.half, zone.half);
+      z = zone.cz + randInt(-zone.half, zone.half);
+      tailLen = randInt(3, 8);
+      hue = 200 + (id % 2) * -55 + rand(-10, 10); // blues ~200 / greens ~145
+      sat = 55; light = 58;
     } else {
-      s = {
-        id, opt: false,
-        pos: randomVolumePoint(),
-        dir: randomVolumePoint().normalize(),
-        clusterId: -1, zone: null,
-        hue: rand(0, 360), sat: 90, light: 60,
-        tailLen: 20 + Math.floor(rand(0, 21)), // 20..40
-        tail: [],
-        target: randomVolumePoint(),
-        pausedUntil: 0,
-        speed: rand(0.9, 1.6),
-      };
+      x = randInt(0, side - 1);
+      z = randInt(0, side - 1);
+      tailLen = randInt(20, 40);
+      hue = rand(0, 360); sat = 88; light = 58;
     }
-    tmpColor.setHSL(((s.hue % 360) + 360) % 360 / 360, s.sat / 100, s.light / 100);
+    const dirIdx = randInt(0, 3);
+    const s = {
+      id, opt, zone, dirIdx,
+      cells: [],               // flat [x0,z0, x1,z1, ...] head-first
+      tailLen,
+      hue, sat, light,
+      tx: 0, tz: 0,            // target cell (optimized)
+      acc: Math.random(),      // tick accumulator (desyncs snakes)
+      speed: opt ? rand(0.75, 1.15) : rand(0.9, 1.5),
+      pausedUntil: 0,
+    };
+    // prefill body behind the head so tails are visible immediately
+    const d = DIRS[dirIdx];
+    let bx = x, bz = z;
+    s.cells.push(bx, bz);
+    occAdd(key(bx, bz), id);
+    for (let i = 1; i < tailLen; i++) {
+      const nx = bx - d[0], nz = bz - d[1];
+      if (nx < 0 || nz < 0 || nx >= side || nz >= side) break;
+      if (opt && (Math.abs(nx - zone.cx) > zone.half || Math.abs(nz - zone.cz) > zone.half)) break;
+      bx = nx; bz = nz;
+      s.cells.push(bx, bz);
+      occAdd(key(bx, bz), id);
+    }
+    if (opt) pickTarget(s);
+    tmpColor.setHSL(((hue % 360) + 360) % 360 / 360, sat / 100, light / 100);
     s.r = tmpColor.r; s.g = tmpColor.g; s.b = tmpColor.b;
     return s;
   }
 
-  // ---------- Rebuild population ----------
-  function rebuild() {
-    if (clusters.length === 0) seedClusters();
-    const n = config.agentCount;
-    const opt = config.mode === 'optimized';
-    if (snakes.length === n && snakes[0] && snakes[0].opt === opt) return;
-    const sameMode = snakes.length > 0 && snakes[0].opt === opt;
-    if (!sameMode) {
-      snakes = [];
-      for (let i = 0; i < n; i++) snakes.push(makeSnake(i));
-    } else if (n > snakes.length) {
-      for (let i = snakes.length; i < n; i++) snakes.push(makeSnake(i));
-    } else if (n < snakes.length) {
-      snakes.length = n;
-    }
+  function freeSnake(s) {
+    for (let i = 0; i < s.cells.length; i += 2) occRemove(key(s.cells[i], s.cells[i + 1]));
   }
 
-  function reassignZones() {
-    for (const s of snakes) {
-      if (s.opt) s.zone = clusters[s.clusterId % clusters.length];
-    }
+  function pickTarget(s) {
+    s.tx = s.zone.cx + randInt(-s.zone.half, s.zone.half);
+    s.tz = s.zone.cz + randInt(-s.zone.half, s.zone.half);
   }
 
-  // ---------- Update ----------
-  const desired = new THREE.Vector3();
-  function update(dt, now) {
-    const step = dt * config.speed; // ms scaled
+  // ---------- Stepping (classic snake rules) ----------
+  function pCollide() {
+    if (config.mode === 'naive') return 0.02 + config.density * 0.10;
+    const over = Math.max(0, (config.density - 0.7) / 0.3);
+    return 0.004 + over * 0.06 * (1 - config.correlation * 0.4);
+  }
 
-    for (const s of snakes) {
-      if (now < s.pausedUntil) continue;
+  function inBounds(x, z) { return x >= 0 && z >= 0 && x < side && z < side; }
+  function inZone(s, x, z) {
+    return Math.abs(x - s.zone.cx) <= s.zone.half && Math.abs(z - s.zone.cz) <= s.zone.half;
+  }
 
-      if (s.opt) {
-        desired.copy(s.target).sub(s.pos);
-        const d = desired.length();
-        if (d < 8) { s.target.copy(newTargetOpt(s.zone)); desired.copy(s.target).sub(s.pos); }
-        desired.normalize();
-        s.dir.lerp(desired, 0.09);
-        // mild organic jitter
-        s.dir.x += Math.sin(now * 0.002 + s.id * 1.7) * 0.012;
-        s.dir.y += Math.cos(now * 0.0016 + s.id * 2.3) * 0.012;
-        s.dir.z += Math.sin(now * 0.0018 + s.id * 0.9) * 0.012;
-        s.dir.normalize();
-        const v = 0.045 * s.speed * step;
-        s.pos.addScaledVector(s.dir, v);
-        // clamp to zone
-        desired.set(s.pos.x - s.zone.cx, s.pos.y - s.zone.cy, s.pos.z - s.zone.cz);
-        const rd = desired.length();
-        if (rd > s.zone.r) {
-          desired.multiplyScalar((s.zone.r * 0.95) / rd);
-          s.pos.set(s.zone.cx + desired.x, s.zone.cy + desired.y, s.zone.cz + desired.z);
-          s.target.copy(newTargetOpt(s.zone));
+  function step(s, now) {
+    const hx = s.cells[0], hz = s.cells[1];
+    let nd;
+    if (s.opt) {
+      if (!inZone(s, hx, hz)) {
+        // zone moved/shrank out from under us: walk back toward zone center,
+        // ignoring the zone constraint until we're inside again
+        const dx = s.zone.cx - hx, dz = s.zone.cz - hz;
+        const rev = (s.dirIdx + 2) % 4;
+        const cands = Math.abs(dx) >= Math.abs(dz)
+          ? [dx > 0 ? 0 : 2, dz > 0 ? 1 : 3]
+          : [dz > 0 ? 1 : 3, dx > 0 ? 0 : 2];
+        nd = -1;
+        for (const c of cands) {
+          if (c === rev) continue;
+          if (inBounds(hx + DIRS[c][0], hz + DIRS[c][1])) { nd = c; break; }
         }
+        if (nd === -1) nd = rev;
       } else {
-        // fresh random target frequently, erratic steering
-        if (Math.random() < 0.04) s.target.copy(randomVolumePoint());
-        desired.copy(s.target).sub(s.pos).normalize();
-        s.dir.lerp(desired, 0.18);
-        s.dir.x += rand(-0.09, 0.09);
-        s.dir.y += rand(-0.09, 0.09);
-        s.dir.z += rand(-0.09, 0.09);
-        s.dir.normalize();
-        const v = 0.07 * s.speed * step;
-        s.pos.addScaledVector(s.dir, v);
-        // bounce off volume walls
-        if (Math.abs(s.pos.x) > WORLD.w / 2) { s.pos.x = Math.sign(s.pos.x) * WORLD.w / 2; s.dir.x *= -1; }
-        if (Math.abs(s.pos.y) > WORLD.h / 2) { s.pos.y = Math.sign(s.pos.y) * WORLD.h / 2; s.dir.y *= -1; }
-        if (Math.abs(s.pos.z) > WORLD.d / 2) { s.pos.z = Math.sign(s.pos.z) * WORLD.d / 2; s.dir.z *= -1; }
+      // greedy toward target, axis-aligned, no reversing
+      const dx = s.tx - hx, dz = s.tz - hz;
+      if (dx === 0 && dz === 0) pickTarget(s);
+      const cands = [];
+      const xDir = dx > 0 ? 0 : 2, zDir = dz > 0 ? 1 : 3;
+      if (Math.abs(dx) >= Math.abs(dz)) { if (dx) cands.push(xDir); if (dz) cands.push(zDir); }
+      else { if (dz) cands.push(zDir); if (dx) cands.push(xDir); }
+      cands.push(s.dirIdx); // straight as fallback
+      const rev = (s.dirIdx + 2) % 4;
+      nd = -1;
+      for (const c of cands) {
+        if (c === rev) continue;
+        const nx = hx + DIRS[c][0], nz = hz + DIRS[c][1];
+        if (inBounds(nx, nz) && inZone(s, nx, nz)) { nd = c; break; }
       }
-
-      // tail
-      s.tail.push(s.pos.x, s.pos.y, s.pos.z);
-      const maxLen = s.tailLen * 3;
-      if (s.tail.length > maxLen) s.tail.splice(0, s.tail.length - maxLen);
-    }
-  }
-
-  // ---------- Collision detection (3D spatial hash) ----------
-  function detectCollisions(now) {
-    const cell = 16;
-    const grid = new Map();
-    const proximity = config.mode === 'optimized' ? 7 : 6;
-    const prox2 = proximity * proximity;
-
-    let pCollide;
-    if (config.mode === 'naive') {
-      pCollide = 0.02 + config.density * 0.10;
+      if (nd === -1) { // boxed in: try any non-reversing move inside zone
+        for (let c = 0; c < 4; c++) {
+          if (c === rev) continue;
+          const nx = hx + DIRS[c][0], nz = hz + DIRS[c][1];
+          if (inBounds(nx, nz) && inZone(s, nx, nz)) { nd = c; break; }
+        }
+      }
+      if (nd === -1) { pickTarget(s); return; } // stay put this tick
+      }
     } else {
-      const over = Math.max(0, (config.density - 0.7) / 0.3);
-      pCollide = 0.004 + over * 0.06 * (1 - config.correlation * 0.4);
+      // erratic: frequent random turns, never reverse
+      const r = Math.random();
+      nd = r < 0.24 ? (s.dirIdx + 1) % 4 : r < 0.48 ? (s.dirIdx + 3) % 4 : s.dirIdx;
+      const rev = (s.dirIdx + 2) % 4;
+      const tries = [nd, s.dirIdx, (s.dirIdx + 1) % 4, (s.dirIdx + 3) % 4];
+      nd = -1;
+      for (const c of tries) {
+        if (c === rev) continue;
+        const nx = hx + DIRS[c][0], nz = hz + DIRS[c][1];
+        if (inBounds(nx, nz)) { nd = c; break; }
+      }
+      if (nd === -1) nd = rev; // cornered: reverse (rare)
     }
 
-    for (const s of snakes) {
-      const cx = Math.floor(s.pos.x / cell), cy = Math.floor(s.pos.y / cell), cz = Math.floor(s.pos.z / cell);
-      for (let gx = cx - 1; gx <= cx + 1; gx++)
-        for (let gy = cy - 1; gy <= cy + 1; gy++)
-          for (let gz = cz - 1; gz <= cz + 1; gz++) {
-            const bucket = grid.get(gx + ',' + gy + ',' + gz);
-            if (!bucket) continue;
-            for (const o of bucket) {
-              if (o.id >= s.id) continue;
-              const dx = o.pos.x - s.pos.x, dy = o.pos.y - s.pos.y, dz = o.pos.z - s.pos.z;
-              if (dx * dx + dy * dy + dz * dz < prox2 && Math.random() < pCollide) {
-                registerCollision(
-                  (s.pos.x + o.pos.x) / 2, (s.pos.y + o.pos.y) / 2, (s.pos.z + o.pos.z) / 2,
-                  s, o, now
-                );
-              }
-            }
-          }
-      const key = cx + ',' + cy + ',' + cz;
-      let bucket = grid.get(key);
-      if (!bucket) { bucket = []; grid.set(key, bucket); }
-      bucket.push(s);
+    const nx = hx + DIRS[nd][0], nz = hz + DIRS[nd][1];
+    s.dirIdx = nd;
+    const k = key(nx, nz);
+
+    // bit collision: entering a voxel already occupied by another snake
+    const e = occ.get(k);
+    if (e && e.n > 0 && e.id !== s.id && Math.random() < pCollide()) {
+      registerCollision(nx, nz, s, e.id, now);
     }
+
+    occAdd(k, s.id);
+    s.cells.unshift(nx, nz);
+    if (s.cells.length / 2 > s.tailLen) {
+      const tx = s.cells.pop(), tz = s.cells.pop();
+      occRemove(key(tx, tz));
+    }
+
+    // flip the bit: field voxel lights up with this snake's hue
+    bitVal[k] = Math.min(1.4, bitVal[k] + 0.9);
+    bitHue[k] = s.hue;
+    bitSat[k] = s.sat / 100;
   }
 
-  function registerCollision(x, y, z, a, b, now) {
-    const sprite = collSprites[collCursor];
-    collCursor = (collCursor + 1) % COLL_POOL;
+  function registerCollision(x, z, a, otherId, now) {
+    bitVal[key(x, z)] = 1.6;
+    bitHue[key(x, z)] = 0;   // red
+    bitSat[key(x, z)] = 0.95;
+    a.pausedUntil = Math.max(a.pausedUntil, now + 500);
+    const other = snakes[otherId];
+    if (other) other.pausedUntil = Math.max(other.pausedUntil, now + 500);
+    collideCountWindow++;
+
     let label = null;
-    if (Math.random() < 0.3) {
+    if (Math.random() < 0.25) {
       label = collLabels[labelCursor];
       labelCursor = (labelCursor + 1) % LABEL_POOL;
-      label.position.set(x, y + 12, z);
+      label.position.set(worldX(x), 2.2, worldZ(z));
       label.visible = true;
     }
-    sprite.position.set(x, y, z);
-    sprite.visible = true;
-    collisions.push({ sprite, label, born: now });
-    a.pausedUntil = Math.max(a.pausedUntil, now + 500);
-    b.pausedUntil = Math.max(b.pausedUntil, now + 500);
-    collideCountWindow++;
+    collisions.push({ x, z, born: now, label });
   }
 
   function updateCollisionFX(now) {
@@ -749,25 +672,33 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
       const c = collisions[i];
       const age = now - c.born;
       if (age > 900) {
-        c.sprite.visible = false;
         if (c.label) c.label.visible = false;
         collisions.splice(i, 1);
         continue;
       }
-      const t = age / 900;
-      const sz = 8 + t * 30;
-      c.sprite.scale.set(sz, sz, 1);
-      c.sprite.material.opacity = 1 - t;
       if (c.label) {
         c.label.element.style.opacity = String(age < 800 ? (1 - age / 800) : 0);
-        c.label.position.y += 0.04;
+        c.label.position.y += 0.008;
+      }
+    }
+  }
+
+  // ---------- Update ----------
+  function update(dt, now) {
+    for (const s of snakes) {
+      if (now < s.pausedUntil) continue;
+      s.acc += (s.speed * config.speed * dt) / TICK_MS;
+      let guard = 4;
+      while (s.acc >= 1 && guard-- > 0) {
+        s.acc -= 1;
+        step(s, now);
       }
     }
   }
 
   // ---------- Synthetic naive overhead (intentional) ----------
-  // Emulates JSON serialization cost growing with agent count so NAIVE visibly chokes
-  // past ~300 agents, while OPTIMIZED stays O(n).
+  // Emulates JSON serialization cost growing with agent count so NAIVE visibly
+  // chokes past ~300 agents, while OPTIMIZED stays O(n).
   function naiveOverhead() {
     if (config.mode !== 'naive') return;
     const n = snakes.length;
@@ -781,56 +712,132 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
   }
 
   // ---------- Fill GPU buffers ----------
-  function fillBuffers(now) {
-    const tp = tailGeo.attributes.position.array;
-    const tc = tailGeo.attributes.color.array;
-    let v = 0; // vertex float cursor
-    for (const s of snakes) {
-      const t = s.tail, n = (t.length / 3) | 0;
-      if (n < 2) continue;
-      const segs = n - 1;
-      const dim = now < s.pausedUntil ? 0.3 : 1;
-      for (let k = 0; k < segs; k++) {
-        const f0 = k / segs, f1 = (k + 1) / segs;   // 0 tail .. 1 head
-        const a0 = (0.03 + f0 * f0 * 0.95) * dim;
-        const a1 = (0.03 + f1 * f1 * 0.95) * dim;
-        const i3 = k * 3;
-        tp[v] = t[i3];     tp[v + 1] = t[i3 + 1]; tp[v + 2] = t[i3 + 2];
-        tc[v] = s.r * a0;  tc[v + 1] = s.g * a0;  tc[v + 2] = s.b * a0;
-        v += 3;
-        tp[v] = t[i3 + 3]; tp[v + 1] = t[i3 + 4]; tp[v + 2] = t[i3 + 5];
-        tc[v] = s.r * a1;  tc[v + 1] = s.g * a1;  tc[v + 2] = s.b * a1;
-        v += 3;
+  const tmpMat = new THREE.Matrix4();
+  const tmpCol = new THREE.Color();
+  const tmpCol2 = new THREE.Color();
+
+  function fillBits(dt) {
+    const decay = Math.pow(0.94, dt / 16.7);
+    let n = 0;
+    for (let z = 0; z < side; z++) {
+      for (let x = 0; x < side; x++) {
+        const k = x + z * side;
+        let v = bitVal[k] * decay;
+        bitVal[k] = v;
+        if (Math.abs(v - bitWritten[k]) > 0.01 || (v === 0 && bitWritten[k] !== 0)) {
+          tmpCol.setRGB(0.035, 0.045, 0.07);
+          if (v > 0.001) {
+            tmpCol2.setHSL(bitHue[k] / 360, bitSat[k], 0.55);
+            tmpCol.r += tmpCol2.r * v;
+            tmpCol.g += tmpCol2.g * v;
+            tmpCol.b += tmpCol2.b * v;
+          }
+          bitMesh.setColorAt(n, tmpCol);
+          bitWritten[k] = v;
+        }
+        tmpMat.makeTranslation(worldX(x), 0.11, worldZ(z));
+        bitMesh.setMatrixAt(n, tmpMat);
+        n++;
       }
     }
-    tailGeo.setDrawRange(0, v / 3);
-    tailGeo.attributes.position.needsUpdate = true;
-    tailGeo.attributes.color.needsUpdate = true;
+    bitMesh.count = n;
+    bitMesh.instanceMatrix.needsUpdate = true;
+    if (bitMesh.instanceColor) bitMesh.instanceColor.needsUpdate = true;
+  }
 
-    const hp = headGeo.attributes.position.array;
-    const hc = headGeo.attributes.color.array;
-    let h = 0;
+  function fillSnakes(now) {
+    let bi = 0, hi = 0;
     for (const s of snakes) {
-      const dim = now < s.pausedUntil ? 0.3 : 1;
-      const boost = 1.35 * dim;
-      hp[h] = s.pos.x; hp[h + 1] = s.pos.y; hp[h + 2] = s.pos.z;
-      hc[h] = Math.min(1, s.r * boost);
-      hc[h + 1] = Math.min(1, s.g * boost);
-      hc[h + 2] = Math.min(1, s.b * boost);
-      h += 3;
+      const cells = s.cells;
+      const len = Math.min(cells.length / 2, s.tailLen);
+      if (len === 0) continue;
+      const t = Math.min(1, s.acc);
+      const paused = now < s.pausedUntil;
+      const dim = paused ? 0.35 : 1;
+      for (let i = 0; i < len; i++) {
+        const ax = cells[i * 2], az = cells[i * 2 + 1];
+        const hasPrev = i + 1 < cells.length / 2;
+        const bx = hasPrev ? cells[i * 2 + 2] : ax;
+        const bz = hasPrev ? cells[i * 2 + 3] : az;
+        const wx = worldX(bx + (ax - bx) * t);
+        const wz = worldZ(bz + (az - bz) * t);
+        const fade = (1 - (i / len) * 0.55) * dim;
+        if (i === 0) {
+          // head: bright, slight hop mid-step
+          const hop = Math.sin(t * Math.PI) * 0.12;
+          tmpMat.makeTranslation(wx, 0.68 + hop, wz);
+          headMesh.setMatrixAt(hi, tmpMat);
+          tmpCol.setRGB(Math.min(1, s.r * 1.5 + 0.25) * dim,
+                        Math.min(1, s.g * 1.5 + 0.25) * dim,
+                        Math.min(1, s.b * 1.5 + 0.25) * dim);
+          headMesh.setColorAt(hi, tmpCol);
+          hi++;
+        } else {
+          tmpMat.makeTranslation(wx, 0.65, wz);
+          bodyMesh.setMatrixAt(bi, tmpMat);
+          tmpCol.setRGB(s.r * fade, s.g * fade, s.b * fade);
+          bodyMesh.setColorAt(bi, tmpCol);
+          bi++;
+        }
+      }
     }
-    headGeo.setDrawRange(0, snakes.length);
-    headGeo.attributes.position.needsUpdate = true;
-    headGeo.attributes.color.needsUpdate = true;
+    bodyMesh.count = bi;
+    headMesh.count = hi;
+    bodyMesh.instanceMatrix.needsUpdate = true;
+    headMesh.instanceMatrix.needsUpdate = true;
+    if (bodyMesh.instanceColor) bodyMesh.instanceColor.needsUpdate = true;
+    if (headMesh.instanceColor) headMesh.instanceColor.needsUpdate = true;
+  }
+
+  // ---------- Rebuild population ----------
+  function rebuild() {
+    const newSide = sideFor(config.agentCount);
+    const gridChanged = newSide !== side;
+    if (gridChanged) {
+      side = newSide;
+      bitVal = new Float32Array(side * side);
+      bitHue = new Float32Array(side * side);
+      bitSat = new Float32Array(side * side);
+      bitWritten = new Float32Array(side * side).fill(-1); // force full color push on first frame
+      rebuildFrame();
+      seedZones();
+    }
+    if (zones.length === 0) seedZones();
+
+    const n = config.agentCount;
+    const opt = config.mode === 'optimized';
+    const sameMode = snakes.length > 0 && snakes[0].opt === opt;
+    if (!sameMode || gridChanged) {
+      for (const s of snakes) freeSnake(s);
+      occ.clear();
+      snakes = [];
+      for (let i = 0; i < n; i++) snakes.push(makeSnake(i));
+    } else if (n > snakes.length) {
+      for (let i = snakes.length; i < n; i++) snakes.push(makeSnake(i));
+    } else if (n < snakes.length) {
+      for (let i = n; i < snakes.length; i++) freeSnake(snakes[i]);
+      snakes.length = n;
+    }
+  }
+
+  function reassignZones() {
+    for (const s of snakes) {
+      if (!s.opt) continue;
+      const old = s.zone;
+      s.zone = zones[s.id % zones.length];
+      if (s.zone !== old) pickTarget(s);
+    }
   }
 
   // ---------- Metrics ----------
   function computeHamming() {
-    // proxy: average distance of snake heads from volume center, mapped to 0..64 "bits"
+    // proxy: average distance of snake heads from grid center, mapped to 0..64 bits
     if (snakes.length === 0) return 0;
     let sum = 0;
-    const norm = Math.hypot(WORLD.w, WORLD.h, WORLD.d) / 2;
-    for (const s of snakes) sum += s.pos.length() / norm;
+    const c = side / 2, norm = side * Math.SQRT1_2;
+    for (const s of snakes) {
+      sum += Math.hypot(s.cells[0] - c, s.cells[1] - c) / norm;
+    }
     return Math.round((sum / snakes.length) * 64);
   }
 
@@ -884,19 +891,32 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 
   // ---------- Mode-dependent scene dressing ----------
   function applyModeLook() {
-    if (config.mode === 'optimized') {
-      grid.material.color.setHex(0x2a4a6e);
-      boundsBox.material.color.setHex(0x4ea8ff);
-      bloomPass.strength = 0.95;
-      headMat.size = 5;
-    } else {
-      grid.material.color.setHex(0x2a2a3d);
-      boundsBox.material.color.setHex(0x8888aa);
-      bloomPass.strength = 1.1;
-      headMat.size = 6.5;
-    }
+    frameLines.material.color.setHex(config.mode === 'optimized' ? 0x4ea8ff : 0x8888aa);
+    bloomPass.strength = config.mode === 'optimized' ? 0.75 : 0.9;
     rebuildZoneMeshes();
   }
+
+  // ---------- Camera framing ----------
+  function frameCamera(dt) {
+    // ease toward a distance that frames the whole field
+    const target = side * 2.1;
+    camDist += (target - camDist) * Math.min(1, dt * 0.003);
+    controls.minDistance = side * 0.4;
+    controls.maxDistance = side * 3.5;
+    // pan only unlocks once zoomed in; ease back to center at full zoom-out
+    const dist = camera.position.distanceTo(controls.target);
+    controls.enablePan = dist < controls.maxDistance * 0.85;
+    if (!controls.enablePan) controls.target.lerp(tmpZero, 0.06);
+    controls.target.x = THREE.MathUtils.clamp(controls.target.x, -side * 0.6, side * 0.6);
+    controls.target.z = THREE.MathUtils.clamp(controls.target.z, -side * 0.6, side * 0.6);
+    controls.target.y = THREE.MathUtils.clamp(controls.target.y, 0, side * 0.4);
+    controls.update();
+    // hold the fixed isometric angle; only the distance eases
+    const dir = camera.position.clone().sub(controls.target).normalize();
+    const want = controls.target.clone().addScaledVector(ISO_DIR, dist);
+    camera.position.lerp(want, 0.04);
+  }
+  const tmpZero = new THREE.Vector3();
 
   // ---------- Main loop ----------
   function frame(now) {
@@ -906,25 +926,12 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     const inst = 1000 / Math.max(1, dt);
     fpsEMA = fpsEMA * 0.92 + inst * 0.08;
 
-    // idle sway (positional only — camera never rotates), eases off while interacting
-    swayAmp += ((interacting ? 0 : 1) - swayAmp) * 0.03;
-    world.position.x = Math.sin(now * 0.00013) * 6 * swayAmp;
-    world.position.y = Math.cos(now * 0.00009) * 4 * swayAmp;
-
-    // pan only unlocks once zoomed in; ease back to center at full zoom-out
-    const dist = controls.getDistance();
-    controls.enablePan = dist < controls.maxDistance - 30;
-    if (!controls.enablePan) controls.target.lerp(PAN_ZERO, 0.06);
-    controls.target.clamp(PAN_MIN, PAN_LIMIT);
-    controls.update();
-
-    dust.rotation.y += dt * 0.00002;
-
     naiveOverhead();
     update(dt, now);
-    detectCollisions(now);
     updateCollisionFX(now);
-    fillBuffers(now);
+    fillBits(dt);
+    fillSnakes(now);
+    frameCamera(dt);
 
     composer.render();
     labelRenderer.render(scene, camera);
@@ -950,11 +957,11 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     rebuild();
   });
   bindRange('density', 'density', v => Math.round(v * 100) + '%', v => v / 100, () => {
-    seedClusters();
+    seedZones();
     if (config.mode === 'optimized') reassignZones();
   });
   bindRange('corr', 'correlation', v => Math.round(v * 100) + '%', v => v / 100, () => {
-    seedClusters();
+    seedZones();
     if (config.mode === 'optimized') reassignZones();
   });
   bindRange('speed', 'speed', v => v.toFixed(1) + '×', v => v / 100);
@@ -1015,9 +1022,12 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 
   // ---------- Boot ----------
   resize();
-  seedClusters();
+  rebuild(); // allocates bit arrays, seeds zones, spawns population
   applyModeLook();
-  rebuild();
+  camDist = side * 2.1;
+  controls.target.set(0, 0, 0);
+  camera.position.copy(ISO_DIR).multiplyScalar(camDist);
+  camera.lookAt(0, 0, 0);
   requestAnimationFrame(frame);
 })();
 </script>
