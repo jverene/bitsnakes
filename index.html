@@ -247,23 +247,28 @@
     <div class="metrics" id="metrics">
       <div class="metric"><div class="k">Active Agents</div><div class="v" id="mAgents">0</div></div>
       <div class="metric"><div class="k">FPS</div><div class="v" id="mFps">60</div></div>
-      <div class="metric"><div class="k">Avg Hamming</div><div class="v" id="mHamming">0<span class="u">bits</span></div></div>
-      <div class="metric"><div class="k">Collisions/s</div><div class="v" id="mColl">0</div></div>
+      <div class="metric"><div class="k">Avg Hamming · nbr</div><div class="v" id="mHamming">0<span class="u">bits</span></div></div>
+      <div class="metric"><div class="k" id="mCollK">Drops/s</div><div class="v" id="mColl">0</div></div>
       <div class="metric full">
-        <div class="k">Bandwidth / agent</div>
+        <div class="k">Bandwidth / agent <span id="mUtil" style="float:right"></span></div>
         <div class="v"><span id="mBw">0</span><span class="u" id="mBwU"> B</span></div>
         <div class="bar"><i id="mBwBar"></i></div>
       </div>
+      <div class="metric full">
+        <div class="k">Schema Load</div>
+        <div class="v"><span id="mSchema">0</span><span class="u"> / 192 bits</span></div>
+        <div class="bar"><i id="mSchemaBar"></i></div>
+      </div>
     </div>
 
-    <div id="saturation">SATURATION POINT REACHED — JSON CHOKING</div>
+    <div id="saturation">SATURATION POINT REACHED</div>
 
-    <div id="msg">Drag the <b>Agent Count</b> slider up and watch NAIVE mode collapse while OPTIMIZED stays smooth. Or hit <b>Saturation Demo</b>.</div>
+    <div id="msg">Drag the <b>Agent Count</b> slider up and watch NAIVE mode saturate the link while OPTIMIZED stays flat. Or hit <b>Saturation Demo</b>.</div>
 
     <div class="legend">
       <span><i style="background:var(--naive)"></i>Naive snake</span>
       <span><i style="background:var(--opt)"></i>Optimized snake</span>
-      <span><i style="background:var(--warn)"></i>Bit collision</span>
+      <span><i style="background:var(--warn)"></i>Collision / drop event</span>
     </div>
   </aside>
 </div>
@@ -294,17 +299,92 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
   const config = {
     mode: 'naive',
     agentCount: 120,
-    density: 0.55,   // 0..1
-    correlation: 0.6,// 0..1
+    density: 0.55,   // fraction of the 256-feature schema in use
+    correlation: 0.6,// 0..1: how similar zone-mates' state vectors are
     speed: 1.0,      // 0.25..3
   };
+
+  // ---------- Encoding model (the numbers we teach with) ----------
+  // Schema: up to FEATURE_SPACE distinct features per agent.
+  //   Naive (JSON-like): each feature serializes as text — key, quotes, colon,
+  //     value, comma — about 14 bytes on the wire, plus object framing.
+  //   Optimized (bitmask): each feature maps to ONE bit in a fixed
+  //     3x uint64 = 192-bit mask → 24 bytes/agent, always.
+  // If features exceed mask capacity (F > 192), an injective mapping is
+  // impossible (pigeonhole); random mappings collide birthday-paradox style.
+  const FEATURE_SPACE = 256;
+  const BITMASK_BITS = 192;          // 3 x uint64 = 24 bytes
+  const JSON_BYTES_PER_FEATURE = 14; // "f042":0.7351, and friends
+  const JSON_FRAMING = 8;            // braces, separators
+  const UPDATES_PER_SEC = 10;        // each agent broadcasts state 10x/s
+  const LINK_CAPACITY_BPS = 8_000_000; // shared medium: ~8 MB/s
+
+  const featureCount = () => Math.max(1, Math.round(config.density * FEATURE_SPACE));
+  function computeBandwidth() {
+    if (config.mode === 'optimized') return BITMASK_BITS / 8; // 24 B, fixed
+    return JSON_FRAMING + featureCount() * JSON_BYTES_PER_FEATURE;
+  }
+  function utilization() {
+    return (snakes.length * computeBandwidth() * UPDATES_PER_SEC) / LINK_CAPACITY_BPS;
+  }
+  // Naive: contention loss on a congested shared medium. Below ~40%
+  // utilization collisions are rare; past it, loss climbs steeply.
+  function contentionLossP() {
+    return Math.min(0.9, 0.04 + Math.max(0, utilization() - 0.4) * 0.35);
+  }
+  // Optimized: expected colliding feature pairs under random mapping is
+  // C(F,2)/B (birthday paradox). Per-step event rate derived from that.
+  function overflowRate() {
+    const F = featureCount();
+    if (F <= BITMASK_BITS) return 0;
+    return Math.min(0.5, 0.06 * (F - BITMASK_BITS) / BITMASK_BITS);
+  }
+
+  // ---------- 64-bit agent state vectors (for real Hamming distances) ----------
+  const popcount32 = x => {
+    x -= (x >> 1) & 0x55555555;
+    x = (x & 0x33333333) + ((x >> 2) & 0x33333333);
+    return (((x + (x >> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+  };
+  const hamming64 = (a, b) => popcount32((a.lo ^ b.lo) >>> 0) + popcount32((a.hi ^ b.hi) >>> 0);
+  const rand32 = () => (Math.random() * 0x100000000) >>> 0;
+  const noiseP = () => 0.02 + (1 - config.correlation) * 0.22;
+
+  // zone-mates share a template; each agent differs by noise ∝ (1 - correlation)
+  function stateFromTemplate(zone) {
+    const p = noiseP();
+    let lo = zone.tlo, hi = zone.thi;
+    for (let b = 0; b < 32; b++) if (Math.random() < p) lo ^= (1 << b);
+    for (let b = 0; b < 32; b++) if (Math.random() < p) hi ^= (1 << b);
+    return [lo >>> 0, hi >>> 0];
+  }
+  function driftState(s) {
+    if (Math.random() >= 0.02) return;
+    const bit = randInt(0, 63);
+    if (s.opt) {
+      // anti-entropy: agents periodically re-converge toward the zone template
+      const tbit = (bit < 32 ? (s.zone.tlo >>> bit) : (s.zone.thi >>> (bit - 32))) & 1;
+      if (bit < 32) s.lo = ((s.lo & ~(1 << bit)) | (tbit << bit)) >>> 0;
+      else s.hi = ((s.hi & ~(1 << (bit - 32))) | (tbit << (bit - 32))) >>> 0;
+    } else {
+      // uncoordinated agents drift freely
+      if (bit < 32) s.lo = (s.lo ^ (1 << bit)) >>> 0;
+      else s.hi = (s.hi ^ (1 << (bit - 32))) >>> 0;
+    }
+  }
+  function corruptState(s) {
+    // a bitmask overflow overwrote a feature: one bit of state is lost
+    const bit = randInt(0, 63);
+    if (bit < 32) s.lo = (s.lo ^ (1 << bit)) >>> 0;
+    else s.hi = (s.hi ^ (1 << (bit - 32))) >>> 0;
+  }
 
   // ---------- Grid ----------
   // The playfield is a side×side lattice of voxel bits. Snakes move one cell
   // per tick, axis-aligned only (classic snake rules), rendered in 3D.
-  const TICK_MS = 150;          // one cell per 150ms at 1× speed
+  const TICK_MS = 150;
   const MAX_SIDE = 128;
-  const MAX_SNAKE_INST = 42000; // 1000 agents × up to 40 body cells + margin
+  const MAX_SNAKE_INST = 42000;
   const DIRS = [[1, 0], [0, 1], [-1, 0], [0, -1]]; // +x, +z, -x, -z
   const rand = (a, b) => a + Math.random() * (b - a);
   const randInt = (a, b) => Math.floor(rand(a, b + 1));
@@ -318,12 +398,12 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 
   // ---------- State ----------
   let snakes = [];
-  let zones = [];               // {cx,cz,half} in cell coords
+  let zones = [];               // {cx,cz,half,tlo,thi}
   let occ = new Map();          // cellKey -> {id, n}
-  let bitVal = new Float32Array(0);   // pulse brightness per cell
-  let bitHue = new Float32Array(0);   // hue of last occupant per cell
+  let bitVal = new Float32Array(0);
+  let bitHue = new Float32Array(0);
   let bitSat = new Float32Array(0);
-  let bitWritten = new Float32Array(0); // last value pushed to GPU
+  let bitWritten = new Float32Array(0);
   let collisions = [];          // {x,z,born,label}
   let lastT = performance.now();
   let fpsEMA = 60;
@@ -434,13 +514,12 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     ]);
   }
 
-  // ---------- Collision labels (CSS2D pool) ----------
+  // ---------- Event labels (CSS2D pool) ----------
   const LABEL_POOL = 8;
   const collLabels = [];
   for (let i = 0; i < LABEL_POOL; i++) {
     const div = document.createElement('div');
     div.className = 'coll-label';
-    div.textContent = 'BIT COLLISION · FEATURE OVERWRITTEN';
     const obj = new CSS2DObject(div);
     obj.visible = false;
     scene.add(obj);
@@ -481,6 +560,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
         cx: tx * tileSide + Math.floor(tileSide / 2),
         cz: tz * tileSide + Math.floor(tileSide / 2),
         half: Math.min(sub, Math.floor(tileSide / 2) - 1),
+        tlo: rand32(), thi: rand32(), // zone's shared state template
       });
     }
     rebuildZoneMeshes();
@@ -522,11 +602,15 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
       cells: [],               // flat [x0,z0, x1,z1, ...] head-first
       tailLen,
       hue, sat, light,
-      tx: 0, tz: 0,            // target cell (optimized)
-      acc: Math.random(),      // tick accumulator (desyncs snakes)
+      tx: 0, tz: 0,
+      acc: Math.random(),
       speed: opt ? rand(0.75, 1.15) : rand(0.9, 1.5),
       pausedUntil: 0,
+      lo: 0, hi: 0,            // 64-bit state vector
     };
+    if (opt) [s.lo, s.hi] = stateFromTemplate(zone);
+    else { s.lo = rand32(); s.hi = rand32(); }
+
     // prefill body behind the head so tails are visible immediately
     const d = DIRS[dirIdx];
     let bx = x, bz = z;
@@ -556,12 +640,6 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
   }
 
   // ---------- Stepping (classic snake rules) ----------
-  function pCollide() {
-    if (config.mode === 'naive') return 0.02 + config.density * 0.10;
-    const over = Math.max(0, (config.density - 0.7) / 0.3);
-    return 0.004 + over * 0.06 * (1 - config.correlation * 0.4);
-  }
-
   function inBounds(x, z) { return x >= 0 && z >= 0 && x < side && z < side; }
   function inZone(s, x, z) {
     return Math.abs(x - s.zone.cx) <= s.zone.half && Math.abs(z - s.zone.cz) <= s.zone.half;
@@ -586,29 +664,29 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
         }
         if (nd === -1) nd = rev;
       } else {
-      // greedy toward target, axis-aligned, no reversing
-      const dx = s.tx - hx, dz = s.tz - hz;
-      if (dx === 0 && dz === 0) pickTarget(s);
-      const cands = [];
-      const xDir = dx > 0 ? 0 : 2, zDir = dz > 0 ? 1 : 3;
-      if (Math.abs(dx) >= Math.abs(dz)) { if (dx) cands.push(xDir); if (dz) cands.push(zDir); }
-      else { if (dz) cands.push(zDir); if (dx) cands.push(xDir); }
-      cands.push(s.dirIdx); // straight as fallback
-      const rev = (s.dirIdx + 2) % 4;
-      nd = -1;
-      for (const c of cands) {
-        if (c === rev) continue;
-        const nx = hx + DIRS[c][0], nz = hz + DIRS[c][1];
-        if (inBounds(nx, nz) && inZone(s, nx, nz)) { nd = c; break; }
-      }
-      if (nd === -1) { // boxed in: try any non-reversing move inside zone
-        for (let c = 0; c < 4; c++) {
+        // greedy toward target, axis-aligned, no reversing
+        const dx = s.tx - hx, dz = s.tz - hz;
+        if (dx === 0 && dz === 0) pickTarget(s);
+        const cands = [];
+        const xDir = dx > 0 ? 0 : 2, zDir = dz > 0 ? 1 : 3;
+        if (Math.abs(dx) >= Math.abs(dz)) { if (dx) cands.push(xDir); if (dz) cands.push(zDir); }
+        else { if (dz) cands.push(zDir); if (dx) cands.push(xDir); }
+        cands.push(s.dirIdx); // straight as fallback
+        const rev = (s.dirIdx + 2) % 4;
+        nd = -1;
+        for (const c of cands) {
           if (c === rev) continue;
           const nx = hx + DIRS[c][0], nz = hz + DIRS[c][1];
           if (inBounds(nx, nz) && inZone(s, nx, nz)) { nd = c; break; }
         }
-      }
-      if (nd === -1) { pickTarget(s); return; } // stay put this tick
+        if (nd === -1) { // boxed in: any non-reversing move inside zone
+          for (let c = 0; c < 4; c++) {
+            if (c === rev) continue;
+            const nx = hx + DIRS[c][0], nz = hz + DIRS[c][1];
+            if (inBounds(nx, nz) && inZone(s, nx, nz)) { nd = c; break; }
+          }
+        }
+        if (nd === -1) { pickTarget(s); return; } // stay put this tick
       }
     } else {
       // erratic: frequent random turns, never reverse
@@ -629,10 +707,23 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     s.dirIdx = nd;
     const k = key(nx, nz);
 
-    // bit collision: entering a voxel already occupied by another snake
-    const e = occ.get(k);
-    if (e && e.n > 0 && e.id !== s.id && Math.random() < pCollide()) {
-      registerCollision(nx, nz, s, e.id, now);
+    if (s.opt) {
+      // Bitmask agents merge state losslessly (bitwise OR): sharing a voxel is
+      // fine. Collisions are an ENCODING failure, not a spatial one — they only
+      // occur when the schema overflows the 192-bit mask (F > B, pigeonhole),
+      // with birthday-paradox scaling. The agent's own state is corrupted.
+      if (Math.random() < overflowRate()) {
+        registerCollision(nx, nz, s, -1, now, 'collision');
+        corruptState(s);
+      }
+    } else {
+      // Naive agents serialize the full document wherever they go. Two agents
+      // writing the same cell = write contention on the shared medium; whether
+      // the update survives depends on congestion (link utilization).
+      const e = occ.get(k);
+      if (e && e.n > 0 && e.id !== s.id && Math.random() < contentionLossP()) {
+        registerCollision(nx, nz, s, e.id, now, 'loss');
+      }
     }
 
     occAdd(k, s.id);
@@ -646,21 +737,30 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     bitVal[k] = Math.min(1.4, bitVal[k] + 0.9);
     bitHue[k] = s.hue;
     bitSat[k] = s.sat / 100;
+
+    driftState(s);
   }
 
-  function registerCollision(x, z, a, otherId, now) {
+  function registerCollision(x, z, a, otherId, now, kind) {
     bitVal[key(x, z)] = 1.6;
     bitHue[key(x, z)] = 0;   // red
     bitSat[key(x, z)] = 0.95;
-    a.pausedUntil = Math.max(a.pausedUntil, now + 500);
-    const other = snakes[otherId];
-    if (other) other.pausedUntil = Math.max(other.pausedUntil, now + 500);
+    // contention: both writers stall (retransmit backoff). overflow: only the
+    // corrupted agent hiccups.
+    a.pausedUntil = Math.max(a.pausedUntil, now + (kind === 'loss' ? 500 : 300));
+    if (otherId >= 0) {
+      const other = snakes[otherId];
+      if (other) other.pausedUntil = Math.max(other.pausedUntil, now + 500);
+    }
     collideCountWindow++;
 
     let label = null;
     if (Math.random() < 0.25) {
       label = collLabels[labelCursor];
       labelCursor = (labelCursor + 1) % LABEL_POOL;
+      label.element.textContent = kind === 'loss'
+        ? 'UPDATE LOST · WRITE CONTENTION'
+        : 'BIT COLLISION · FEATURE OVERWRITTEN';
       label.position.set(worldX(x), 2.2, worldZ(z));
       label.visible = true;
     }
@@ -696,9 +796,10 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     }
   }
 
-  // ---------- Synthetic naive overhead (intentional) ----------
-  // Emulates JSON serialization cost growing with agent count so NAIVE visibly
-  // chokes past ~300 agents, while OPTIMIZED stays O(n).
+  // ---------- Synthetic naive overhead (intentional, illustrative) ----------
+  // Stand-in for real per-agent JSON serialization cost, which grows with
+  // agent count (CPU, GC pressure, allocations). This is a pedagogical
+  // device — real systems would show the same shape, not the same numbers.
   function naiveOverhead() {
     if (config.mode !== 'naive') return;
     const n = snakes.length;
@@ -754,6 +855,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
       const t = Math.min(1, s.acc);
       const paused = now < s.pausedUntil;
       const dim = paused ? 0.35 : 1;
+      const yOff = (s.id % 5) * 0.012; // tiny per-agent lift avoids z-fighting
       for (let i = 0; i < len; i++) {
         const ax = cells[i * 2], az = cells[i * 2 + 1];
         const hasPrev = i + 1 < cells.length / 2;
@@ -763,9 +865,8 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
         const wz = worldZ(bz + (az - bz) * t);
         const fade = (1 - (i / len) * 0.55) * dim;
         if (i === 0) {
-          // head: bright, slight hop mid-step
           const hop = Math.sin(t * Math.PI) * 0.12;
-          tmpMat.makeTranslation(wx, 0.68 + hop, wz);
+          tmpMat.makeTranslation(wx, 0.68 + hop + yOff, wz);
           headMesh.setMatrixAt(hi, tmpMat);
           tmpCol.setRGB(Math.min(1, s.r * 1.5 + 0.25) * dim,
                         Math.min(1, s.g * 1.5 + 0.25) * dim,
@@ -773,7 +874,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
           headMesh.setColorAt(hi, tmpCol);
           hi++;
         } else {
-          tmpMat.makeTranslation(wx, 0.65, wz);
+          tmpMat.makeTranslation(wx, 0.65 + yOff, wz);
           bodyMesh.setMatrixAt(bi, tmpMat);
           tmpCol.setRGB(s.r * fade, s.g * fade, s.b * fade);
           bodyMesh.setColorAt(bi, tmpCol);
@@ -798,7 +899,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
       bitVal = new Float32Array(side * side);
       bitHue = new Float32Array(side * side);
       bitSat = new Float32Array(side * side);
-      bitWritten = new Float32Array(side * side).fill(-1); // force full color push on first frame
+      bitWritten = new Float32Array(side * side).fill(-1); // force full color push
       rebuildFrame();
       seedZones();
     }
@@ -825,26 +926,39 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
       if (!s.opt) continue;
       const old = s.zone;
       s.zone = zones[s.id % zones.length];
-      if (s.zone !== old) pickTarget(s);
+      if (s.zone !== old) {
+        pickTarget(s);
+        [s.lo, s.hi] = stateFromTemplate(s.zone); // re-sample from new template
+      }
     }
   }
 
   // ---------- Metrics ----------
+  // Real Hamming distance between 64-bit state vectors.
+  // Naive: random pairs of uncoordinated agents (expect ~32 of 64 bits).
+  // Optimized: pairs of zone-mates (low when correlation is high).
   function computeHamming() {
-    // proxy: average distance of snake heads from grid center, mapped to 0..64 bits
-    if (snakes.length === 0) return 0;
-    let sum = 0;
-    const c = side / 2, norm = side * Math.SQRT1_2;
-    for (const s of snakes) {
-      sum += Math.hypot(s.cells[0] - c, s.cells[1] - c) / norm;
+    const n = snakes.length;
+    if (n < 2) return 0;
+    const SAMPLES = Math.min(80, n * 2);
+    let sum = 0, cnt = 0;
+    for (let k = 0; k < SAMPLES; k++) {
+      const a = snakes[(Math.random() * n) | 0];
+      let b = null;
+      if (a.opt) {
+        for (let t = 0; t < 5; t++) {
+          const c = snakes[(Math.random() * n) | 0];
+          if (c !== a && c.zone === a.zone) { b = c; break; }
+        }
+      } else {
+        const c = snakes[(Math.random() * n) | 0];
+        if (c !== a) b = c;
+      }
+      if (!b) continue;
+      sum += hamming64(a, b);
+      cnt++;
     }
-    return Math.round((sum / snakes.length) * 64);
-  }
-
-  function computeBandwidth() {
-    if (config.mode === 'optimized') return 24; // fixed 3x uint64 bitmask
-    const features = Math.max(1, Math.round(config.density * 32));
-    return 6 + features * 14;
+    return cnt ? Math.round(sum / cnt) : 0;
   }
 
   function updateMetricsDOM(now) {
@@ -855,18 +969,37 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     }
     const hamming = computeHamming();
     const bw = computeBandwidth();
+    const util = utilization();
+    const F = featureCount();
+    const overflow = F > BITMASK_BITS;
+
     $('mAgents').textContent = snakes.length;
     $('mFps').textContent = Math.round(fpsEMA);
     $('mHamming').innerHTML = hamming + '<span class="u">bits</span>';
+    $('mCollK').textContent = config.mode === 'optimized' ? 'Collisions/s' : 'Drops/s';
     $('mColl').textContent = collisionsPerSec;
     if (bw >= 1024) { $('mBw').textContent = (bw / 1024).toFixed(1); $('mBwU').textContent = ' KB'; }
     else { $('mBw').textContent = bw; $('mBwU').textContent = ' B'; }
-    const bwPct = Math.min(100, (bw / 512) * 100);
+    $('mUtil').textContent = 'link ' + Math.round(util * 100) + '%';
+    $('mUtil').style.color = util > 1 ? 'var(--warn)' : 'var(--muted)';
+    const bwPct = Math.min(100, (bw / 3600) * 100);
     $('mBwBar').style.width = bwPct + '%';
     $('mBwBar').style.background = config.mode === 'optimized' ? 'var(--accent2)' : 'var(--naive)';
 
-    const saturated = (config.mode === 'naive' && (fpsEMA < 30 || collisionsPerSec > 40));
-    $('saturation').classList.toggle('on', saturated);
+    $('mSchema').textContent = F;
+    $('mSchemaBar').style.width = Math.min(100, (F / BITMASK_BITS) * 100) + '%';
+    $('mSchemaBar').style.background = overflow ? 'var(--warn)' : 'var(--accent)';
+
+    const satEl = $('saturation');
+    let sat;
+    if (config.mode === 'naive') {
+      sat = fpsEMA < 30 || util > 1;
+      satEl.textContent = 'LINK SATURATED — JSON TRAFFIC EXCEEDS CAPACITY';
+    } else {
+      sat = overflow;
+      satEl.textContent = `SCHEMA OVERFLOW — ${F} FEATURES > ${BITMASK_BITS}-BIT MASK`;
+    }
+    satEl.classList.toggle('on', sat);
 
     updateMessage();
   }
@@ -874,17 +1007,20 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
   function updateMessage() {
     const n = snakes.length;
     const el = $('msg');
+    const F = featureCount();
+    const bw = computeBandwidth();
+    const util = utilization();
     let html;
     if (config.mode === 'naive') {
-      if (n < 150) html = '<b>JSON is better here</b> — readable, flexible, zero schema overhead. Small N tolerates the cost.';
-      else if (n < 300) html = '<b>Trade-off zone</b> — pick your poison. Naive still works but the cost is climbing.';
-      else if (n < 500) html = '<b>Naive is straining.</b> Long messages, repeated keys, garbage-collection pressure. Bandwidth is blowing up.';
-      else html = '<b>Bitmask wins</b> — compact, fast, scalable. Naive serialization cost grows with every agent.';
+      if (n < 150) html = `<b>JSON is fine here</b> — self-describing, no schema to maintain, and ~${bw} B/agent is cheap at small N (link ${Math.round(util * 100)}%).`;
+      else if (n < 300) html = `<b>Trade-off zone</b> — every agent serializes all ${F} features as text (~${bw} B). Offered load is climbing toward capacity.`;
+      else if (n < 500) html = `<b>Naive is straining.</b> Link ${Math.round(util * 100)}% utilized — congestion loss and retransmit stalls are kicking in. Watch Drops/s.`;
+      else html = `<b>Link saturated.</b> ${n} agents × ~${bw} B × ${UPDATES_PER_SEC} Hz exceeds capacity. A 192-bit mask carries the same state in 24 B/agent.`;
     } else {
-      if (config.density > 0.78) html = '<b>Even bitmasks saturate</b> when bits &lt; features. Schema density is hitting the protocol limit.';
-      else if (config.correlation < 0.25) html = 'Low correlation scatters optimized snakes too — related features no longer share zones.';
-      else if (n >= 800) html = '<b>Optimized holds the line.</b> Fixed 24 B/agent, O(n) work — this is why protocol optimization matters at scale.';
-      else html = '<b>Bitmask protocol:</b> related features mapped to adjacent bits, agents cluster into feature zones. Low Hamming distance, low collision.';
+      if (F > BITMASK_BITS) html = `<b>Even bitmasks saturate:</b> ${F} features can't injectively map into ${BITMASK_BITS} bits. Random mappings collide — expected pairs ∝ F·(F−1)/2B (birthday paradox).`;
+      else if (config.correlation < 0.25) html = 'Low correlation decorrelates zone-mates — Avg Hamming climbs toward 32 bits (the expected distance of random 64-bit vectors).';
+      else if (n >= 800) html = `<b>Optimized holds the line.</b> Fixed 24 B/agent (link ${Math.round(util * 100)}%), lossless OR-merge, O(n) work — this is why protocol design matters at scale.`;
+      else html = `<b>Bitmask protocol:</b> ${F} features fit in ${BITMASK_BITS} bits, so mappings are injective — zero collisions. Zone-mates share a template, so neighbor Hamming stays low.`;
     }
     el.innerHTML = html;
   }
@@ -897,6 +1033,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
   }
 
   // ---------- Camera framing ----------
+  const tmpZero = new THREE.Vector3();
   function frameCamera(dt) {
     // ease toward a distance that frames the whole field
     const target = side * 2.1;
@@ -916,7 +1053,6 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
     const want = controls.target.clone().addScaledVector(ISO_DIR, dist);
     camera.position.lerp(want, 0.04);
   }
-  const tmpZero = new THREE.Vector3();
 
   // ---------- Main loop ----------
   function frame(now) {
